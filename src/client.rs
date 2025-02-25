@@ -41,10 +41,12 @@ pub struct Client {
     pub connection_reader: Mutex<OwnedReadHalf>,
     pub connection_writer: Mutex<OwnedWriteHalf>,
     pub client_packets_queue: Arc<Mutex<VecDeque<RawPacket>>>,
+    // Its read-only and not needs AtomicBool
+    realistic: bool
 }
 
 impl Client {
-    pub fn new(stream: TcpStream) -> Self {
+    pub fn new(stream: TcpStream, realistic: bool) -> Self {
         let (connection_reader, connection_writer) = stream.into_split();
         Self {
             connection_state: AtomicCell::new(ConnectionState::HandShake),
@@ -54,6 +56,7 @@ impl Client {
             connection_reader: Mutex::new(connection_reader),
             connection_writer: Mutex::new(connection_writer),
             client_packets_queue: Arc::new(Mutex::new(VecDeque::new())),
+            realistic,
         }
     }
 

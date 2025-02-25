@@ -10,35 +10,35 @@ mod client;
 #[command(version, about, long_about = None)]
 struct Args {
     #[arg(short, long)]
-    ip: String,
+    address: Arc<String>,
     #[arg(short, long, default_value_t = 25565)]
     port: u16,
     #[arg(short, long, default_value_t = 1)]
     count: u32,
+    #[arg(short, long, default_value_t = false)]
+    realistic: bool,
 }
 
 #[tokio::main]
 async fn main() {
     simple_logger::init_with_level(log::Level::Info).unwrap();
     let args = Args::parse();
-    let address = Arc::new(args.ip);
-    let port = args.port;
 
-    log::info!("{} Bots will Join {}", args.count, address);
+    log::info!("{} Bots will Join {}", args.count, args.address);
 
     let counter = Arc::new(AtomicUsize::new(0));
     for _ in 0..args.count {
         let counter = counter.clone();
-        let address = address.clone();
+        let address = args.address.clone();
 
         tokio::spawn(async move {
-            let stream = TcpStream::connect(address.to_string() + ":" + &port.to_string())
+            let stream = TcpStream::connect(address.to_string() + ":" + &args.port.to_string())
                 .await
                 .expect("Failed to connect to Ip");
-            let client = Client::new(stream);
+            let client = Client::new(stream, args.realistic);
             let i = counter.fetch_add(1, Ordering::Relaxed);
             
-            client.join_server(address.to_string(), port, format!("BOT_{i}")).await;
+            client.join_server(address.to_string(), args.port, format!("BOT_{i}")).await;
             log::info!("{}/{} Bots Joined", i + 1, args.count);
     
             loop {
