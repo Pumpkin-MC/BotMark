@@ -17,7 +17,6 @@ use pumpkin_protocol::{
     packet_decoder::PacketDecoder, packet_encoder::PacketEncoder,
 };
 use std::collections::VecDeque;
-use std::net::SocketAddr;
 use std::sync::{Arc, atomic::AtomicBool};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::{
@@ -170,11 +169,11 @@ impl Client {
         }
     }
 
-    pub async fn join_server(&self, address: SocketAddr, name: String) {
+    pub async fn join_server(&self, ip: String, port: u16, name: String) {
         self.send_packet(&SHandShake {
             protocol_version: VarInt(CURRENT_MC_PROTOCOL.get() as i32),
-            server_address: address.ip().to_string(),
-            server_port: address.port(),
+            server_address: ip,
+            server_port: port,
             next_state: pumpkin_protocol::ConnectionState::Login,
         })
         .await;
@@ -214,7 +213,7 @@ impl Client {
                 .await
             }
             CLoginDisconnect::PACKET_ID => {
-                log::error!("Kicking in Login State");
+                log::error!("Kicking in Login State with reason:\n{}", String::from_utf8_lossy(packet.bytebuf.iter().as_slice()));
                 self.close().await;
             }
             CLoginSuccess::PACKET_ID => {
