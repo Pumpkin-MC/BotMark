@@ -17,7 +17,6 @@ use pumpkin_protocol::{
     packet_decoder::PacketDecoder, packet_encoder::PacketEncoder,
 };
 use std::collections::VecDeque;
-use std::net::SocketAddr;
 use std::sync::{Arc, atomic::AtomicBool};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::{
@@ -42,10 +41,12 @@ pub struct Client {
     pub connection_reader: Mutex<OwnedReadHalf>,
     pub connection_writer: Mutex<OwnedWriteHalf>,
     pub client_packets_queue: Arc<Mutex<VecDeque<RawPacket>>>,
+    // Its read-only and not needs AtomicBool
+    realistic: bool
 }
 
 impl Client {
-    pub fn new(stream: TcpStream) -> Self {
+    pub fn new(stream: TcpStream, realistic: bool) -> Self {
         let (connection_reader, connection_writer) = stream.into_split();
         Self {
             connection_state: AtomicCell::new(ConnectionState::HandShake),
@@ -55,6 +56,7 @@ impl Client {
             connection_reader: Mutex::new(connection_reader),
             connection_writer: Mutex::new(connection_writer),
             client_packets_queue: Arc::new(Mutex::new(VecDeque::new())),
+            realistic,
         }
     }
 
@@ -170,11 +172,11 @@ impl Client {
         }
     }
 
-    pub async fn join_server(&self, address: SocketAddr, name: String) {
+    pub async fn join_server(&self, ip: String, port: u16, name: String) {
         self.send_packet(&SHandShake {
             protocol_version: VarInt(CURRENT_MC_PROTOCOL.get() as i32),
-            server_address: address.ip().to_string(),
-            server_port: address.port(),
+            server_address: ip,
+            server_port: port,
             next_state: pumpkin_protocol::ConnectionState::Login,
         })
         .await;
@@ -214,7 +216,7 @@ impl Client {
                 .await
             }
             CLoginDisconnect::PACKET_ID => {
-                log::error!("Kicking in Login State");
+                log::error!("Kicking in Login State with reason:\n{}", String::from_utf8_lossy(packet.bytebuf.iter().as_slice()));
                 self.close().await;
             }
             CLoginSuccess::PACKET_ID => {

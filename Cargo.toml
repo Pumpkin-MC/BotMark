@@ -15,7 +15,7 @@ simple_logger = "5.0.0"
 clap = { version = "4.5.30", features = ["derive"] }
 # Networking
 tokio = { version = "1.43.0", features = ["net", "io-util"] }
-pumpkin-protocol = { git = "https://github.com/Pumpkin-MC/Pumpkin", package = "pumpkin-protocol", default-features = false, features = ["packets"]}
+pumpkin-protocol = { git = "https://github.com/Pumpkin-MC/Pumpkin", package = "pumpkin-protocol", default-features = false, features = ["packets"] }
 
 crossbeam = "0.8.4"
 uuid = "1.14.0"
