@@ -38,17 +38,16 @@ async fn main() {
         let stream = TcpStream::connect(address)
             .await
             .expect("Failed to connect to Ip");
-        let client = Client::new(stream);
+        let client = Arc::new(Client::new(stream));
         let message = Arc::new(args.spam_message.clone());
 
-        client.join_server(address, format!("BOT_{}", i)).await;
+        client.join_server(address, format!("BOT_{i}")).await;
         let join_handle = tokio::spawn(async move {
             loop {
-                if !client.poll().await {
+                if !client.process_packets().await {
                     break;
                 }
                 client.tick(message.clone(), args.spam_message_delay).await;
-                client.process_packets().await;
             }
         });
         join_handles.push(join_handle);

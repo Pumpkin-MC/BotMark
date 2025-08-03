@@ -1,27 +1,31 @@
 use crossbeam::atomic::AtomicCell;
-use pumpkin_protocol::bytebuf::ReadingError;
-use pumpkin_protocol::bytebuf::packet::Packet;
-use pumpkin_protocol::client::config::{CConfigDisconnect, CFinishConfig};
-use pumpkin_protocol::client::login::{
+use pumpkin_data::packet::CURRENT_MC_PROTOCOL;
+use pumpkin_protocol::codec::var_int::VarInt;
+use pumpkin_protocol::java::client::config::{CConfigDisconnect, CFinishConfig};
+use pumpkin_protocol::java::client::login::{
     CEncryptionRequest, CLoginDisconnect, CLoginSuccess, CSetCompression,
 };
-use pumpkin_protocol::client::play::{CKeepAlive, CPlayDisconnect, CPlayerPosition};
-use pumpkin_protocol::codec::var_int::VarInt;
-use pumpkin_protocol::server::config::{SAcknowledgeFinishConfig, SKnownPacks};
-use pumpkin_protocol::server::handshake::SHandShake;
-use pumpkin_protocol::server::login::{SLoginAcknowledged, SLoginStart};
-use pumpkin_protocol::server::play::{SChatMessage, SConfirmTeleport, SKeepAlive};
-use pumpkin_protocol::{CURRENT_MC_PROTOCOL, RawPacket, ServerPacket};
+use pumpkin_protocol::java::client::play::{CKeepAlive, CPlayDisconnect, CPlayerPosition};
+use pumpkin_protocol::java::packet_decoder::TCPNetworkDecoder;
+use pumpkin_protocol::java::packet_encoder::TCPNetworkEncoder;
+use pumpkin_protocol::java::server::config::{SAcknowledgeFinishConfig, SKnownPacks};
+use pumpkin_protocol::java::server::handshake::SHandShake;
+use pumpkin_protocol::java::server::login::{SLoginAcknowledged, SLoginStart};
+use pumpkin_protocol::java::server::play::{SChatMessage, SConfirmTeleport, SKeepAlive};
+use pumpkin_protocol::packet::Packet;
+use pumpkin_protocol::ser::NetworkWriteExt;
+use pumpkin_protocol::ser::{ReadingError, WritingError};
 use pumpkin_protocol::{
-    ClientPacket, CompressionLevel, CompressionThreshold, ConnectionState,
-    packet_decoder::PacketDecoder, packet_encoder::PacketEncoder,
+    ClientPacket, CompressionLevel, CompressionThreshold, ConnectionState, PacketDecodeError,
+    RawPacket, ServerPacket,
 };
-use std::collections::VecDeque;
+use std::io::Write;
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{BufReader, BufWriter};
+use tokio::sync::Notify;
 use tokio::{
     net::{
         TcpStream,
@@ -38,12 +42,10 @@ pub struct Client {
     /// Indicates if the client connection is closed.
     pub closed: AtomicBool,
     /// The packet encoder for outgoing packets.
-    pub enc: Arc<Mutex<PacketEncoder>>,
+    pub network_writer: Arc<Mutex<TCPNetworkEncoder<BufWriter<OwnedWriteHalf>>>>,
     /// The packet decoder for incoming packets.
-    pub dec: Arc<Mutex<PacketDecoder>>,
-    pub connection_reader: Mutex<OwnedReadHalf>,
-    pub connection_writer: Mutex<OwnedWriteHalf>,
-    pub client_packets_queue: Arc<Mutex<VecDeque<RawPacket>>>,
+    pub network_reader: Arc<Mutex<TCPNetworkDecoder<BufReader<OwnedReadHalf>>>>,
+    close_interrupt: Arc<Notify>,
 
     message_spam_cooldown: AtomicU32,
 }
@@ -53,12 +55,14 @@ impl Client {
         let (connection_reader, connection_writer) = stream.into_split();
         Self {
             connection_state: AtomicCell::new(ConnectionState::HandShake),
-            enc: Arc::new(Mutex::new(PacketEncoder::default())),
-            dec: Arc::new(Mutex::new(PacketDecoder::default())),
+            network_writer: Arc::new(Mutex::new(TCPNetworkEncoder::new(BufWriter::new(
+                connection_writer,
+            )))),
+            network_reader: Arc::new(Mutex::new(TCPNetworkDecoder::new(BufReader::new(
+                connection_reader,
+            )))),
             closed: AtomicBool::new(false),
-            connection_reader: Mutex::new(connection_reader),
-            connection_writer: Mutex::new(connection_writer),
-            client_packets_queue: Arc::new(Mutex::new(VecDeque::new())),
+            close_interrupt: Arc::new(Notify::new()),
             message_spam_cooldown: AtomicU32::new(1),
         }
     }
@@ -75,81 +79,59 @@ impl Client {
         &self,
         compression: Option<(CompressionThreshold, CompressionLevel)>,
     ) {
-        self.dec.lock().await.set_compression(compression.is_some());
-        self.enc
-            .lock()
-            .await
-            .set_compression(compression.map(|s| (s.0, s.1)))
-            .unwrap_or_else(|_| log::warn!("invalid compression level"));
-    }
-
-    pub async fn process_packets(&self) {
-        let mut packet_queue = self.client_packets_queue.lock().await;
-        while let Some(mut packet) = packet_queue.pop_front() {
-            if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
-                log::debug!("Canceling client packet processing (pre)");
-                return;
-            }
-            if let Err(error) = self.handle_packet(&mut packet).await {
-                log::error!(
-                    "Failed to read incoming packet with id {}: {}",
-                    i32::from(packet.id),
-                    error
-                );
-                self.close().await;
-            };
+        if let Some(compression) = compression {
+            self.network_reader
+                .lock()
+                .await
+                .set_compression(compression.0);
+            self.network_writer
+                .lock()
+                .await
+                .set_compression(compression);
         }
     }
-    pub async fn add_packet(&self, packet: RawPacket) {
-        let mut client_packets_queue = self.client_packets_queue.lock().await;
-        client_packets_queue.push_back(packet);
+
+    pub async fn await_close_interrupt(&self) {
+        self.close_interrupt.notified().await;
     }
 
-    pub async fn poll(&self) -> bool {
-        loop {
-            if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
-                // If we manually close (like a kick) we dont want to keep reading bytes
-                return false;
-            }
-
-            let mut dec = self.dec.lock().await;
-
-            match dec.decode() {
-                Ok(Some(packet)) => {
-                    self.add_packet(packet).await;
-                    return true;
-                }
-                Ok(None) => (), //log::debug!("Waiting for more data to complete packet..."),
-                Err(err) => {
-                    log::warn!("Failed to decode packet for: {}", err.to_string());
-                    self.close().await;
-                    return false; // return to avoid reserving additional bytes
-                }
-            }
-
-            dec.reserve(4096);
-            let mut buf = dec.take_capacity();
-
-            let bytes_read = self.connection_reader.lock().await.read_buf(&mut buf).await;
-            match bytes_read {
-                Ok(cnt) => {
-                    //log::debug!("Read {} bytes", cnt);
-                    if cnt == 0 {
-                        self.close().await;
-                        return false;
+    pub async fn get_packet(&self) -> Option<RawPacket> {
+        let mut network_reader = self.network_reader.lock().await;
+        tokio::select! {
+            () = self.await_close_interrupt() => {
+                log::debug!("Canceling player packet processing");
+                None
+            },
+            packet_result = network_reader.get_raw_packet() => {
+                match packet_result {
+                    Ok(packet) => Some(packet),
+                    Err(err) => {
+                        if !matches!(err, PacketDecodeError::ConnectionClosed) {
+                            log::warn!("Failed to decode packet from client: {err}");
+                            self.close().await;
+                        }
+                        None
                     }
                 }
-                Err(error) => {
-                    log::error!("Error while reading incoming packet {}", error);
-                    self.close().await;
-                    return false;
-                }
-            };
-
-            // This should always be an O(1) unsplit because we reserved space earlier and
-            // the call to `read_buf` shouldn't have grown the allocation.
-            dec.queue_bytes(buf);
+            }
         }
+    }
+
+    pub async fn process_packets(self: &Arc<Self>) -> bool {
+        let packet = self.get_packet().await;
+        let Some(mut packet) = packet else {
+            return false;
+        };
+
+        if let Err(error) = self.handle_packet(&mut packet).await {
+            log::error!(
+                "Failed to read incoming packet with id {}: {}",
+                packet.id,
+                error
+            );
+            self.close().await;
+        }
+        true
     }
 
     // TODO: make this less ugly ig
@@ -175,15 +157,25 @@ impl Client {
         let since_the_epoch = start
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards");
-        self.send_packet(&SChatMessage::new(
+        self.send_packet(&SChatMessage {
             message,
-            since_the_epoch.as_millis() as i64,
-            rand::random(),
-            None,
-            VarInt(1),
-            vec![0; 20],
-        ))
+            timestamp: since_the_epoch.as_millis() as i64,
+            salt: rand::random(),
+            signature: None,
+            message_count: VarInt(1),
+            acknowledged: vec![0; 20].into_boxed_slice(),
+            checksum: 0,
+        })
         .await;
+    }
+
+    pub fn write_packet<P: ClientPacket>(
+        packet: &P,
+        write: impl Write,
+    ) -> Result<(), WritingError> {
+        let mut write = write;
+        write.write_var_int(&VarInt(P::PACKET_ID))?;
+        packet.write_packet_data(write)
     }
 
     /// Sends a clientbound packet to the connected client.
@@ -192,27 +184,30 @@ impl Client {
     ///
     /// * `packet`: A reference to a packet object implementing the `ClientPacket` trait.
     pub async fn send_packet<P: ClientPacket>(&self, packet: &P) {
-        //log::debug!("Sending packet with id {} to {}", P::PACKET_ID, self.id);
-        // assert!(!self.closed);
-        if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
-            return;
-        }
-
-        let mut enc = self.enc.lock().await;
-        if let Err(_error) = enc.append_packet(packet) {
-            return;
-        }
-
-        let mut writer = self.connection_writer.lock().await;
-        if let Err(error) = writer.write_all(&enc.take()).await {
-            log::debug!("Unable to write to connection: {}", error.to_string());
+        let mut packet_buf = Vec::new();
+        let writer = &mut packet_buf;
+        Self::write_packet(packet, writer).unwrap();
+        if let Err(err) = self
+            .network_writer
+            .lock()
+            .await
+            .write_packet(packet_buf.into())
+            .await
+        {
+            // It is expected that the packet will fail if we are closed
+            if !self.closed.load(Ordering::Relaxed) {
+                log::warn!("Failed to send packet to client: {err}");
+                // We now need to close the connection to the client since the stream is in an
+                // unknown state
+                self.close().await;
+            }
         }
     }
 
     pub async fn join_server(&self, address: SocketAddr, name: String) {
         dbg!(address.ip().to_string());
         self.send_packet(&SHandShake {
-            protocol_version: VarInt(CURRENT_MC_PROTOCOL.get() as i32),
+            protocol_version: VarInt(CURRENT_MC_PROTOCOL as i32),
             server_address: address.ip().to_string(),
             server_port: address.port(),
             next_state: pumpkin_protocol::ConnectionState::Login,
@@ -239,19 +234,16 @@ impl Client {
     }
 
     async fn handle_login_packet(&self, packet: &mut RawPacket) -> Result<(), ReadingError> {
-        let bytebuf = &mut packet.bytebuf;
-        match packet.id.0 {
+        let bytebuf = &packet.payload[..];
+        match packet.id {
             CEncryptionRequest::PACKET_ID => {
                 log::debug!("Got Encryption Request")
             }
             CSetCompression::PACKET_ID => {
                 log::trace!("Set Compression");
                 let packet = CSetCompression::read(bytebuf)?;
-                self.set_compression(Some((
-                    CompressionThreshold(packet.threshold.0 as u32),
-                    CompressionLevel(6),
-                )))
-                .await
+                self.set_compression(Some((packet.threshold.0 as usize, 6)))
+                    .await
             }
             CLoginDisconnect::PACKET_ID => {
                 log::error!("Kicking in Login State");
@@ -273,7 +265,7 @@ impl Client {
     }
 
     async fn handle_config_packet(&self, packet: &mut RawPacket) -> Result<(), ReadingError> {
-        match packet.id.0 {
+        match packet.id {
             CConfigDisconnect::PACKET_ID => {
                 log::error!("Kicking in Config State");
                 self.close().await;
@@ -289,8 +281,8 @@ impl Client {
     }
 
     async fn handle_play_packet(&self, packet: &mut RawPacket) -> Result<(), ReadingError> {
-        let bytebuf = &mut packet.bytebuf;
-        match packet.id.0 {
+        let bytebuf = &packet.payload[..];
+        match packet.id {
             CKeepAlive::PACKET_ID => {
                 let packet = CKeepAlive::read(bytebuf)?;
                 self.send_packet(&SKeepAlive {
@@ -315,6 +307,7 @@ impl Client {
     }
 
     pub async fn close(&self) {
+        self.close_interrupt.notify_waiters();
         self.closed
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
