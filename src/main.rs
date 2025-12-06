@@ -2,7 +2,7 @@ use std::{net::SocketAddr, sync::Arc, thread::sleep, time::Duration};
 
 use clap::Parser;
 use client::Client;
-use tokio::net::TcpStream;
+use tokio::{net::TcpStream, time::timeout};
 
 mod client;
 
@@ -10,11 +10,13 @@ mod client;
 #[command(version, about, long_about = None)]
 pub struct Args {
     #[arg(long)]
-    ip: String,
+    pub ip: String,
     #[arg(short, long, default_value_t = 1)]
-    count: u32,
+    pub count: u32,
     #[arg(short, long, default_value_t = 200)]
-    delay: u64,
+    pub delay: u64,
+    #[arg(short, long, default_value_t = 5000)]
+    pub timeout: u64,
     #[arg(long)]
     pub spam_message: Option<String>,
     #[arg(long, default_value_t = 210)]
@@ -35,9 +37,28 @@ async fn main() {
     let mut join_handles = Vec::with_capacity(args.count as usize);
     for i in 0..args.count {
         sleep(Duration::from_millis(args.delay));
-        let stream = TcpStream::connect(address)
-            .await
-            .expect("Failed to connect to Ip");
+        let stream_result = timeout(
+            Duration::from_millis(args.timeout),
+            TcpStream::connect(address),
+        )
+        .await;
+
+        let stream = match stream_result {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                log::error!("Bot {} failed to connect to {}: {}", i + 1, address, e);
+                continue;
+            }
+            Err(_) => {
+                log::error!(
+                    "Bot {} connection to {} timed out after {}ms",
+                    i + 1,
+                    address,
+                    args.timeout
+                );
+                continue;
+            }
+        };
         let client = Arc::new(Client::new(stream));
         let message = Arc::new(args.spam_message.clone());
 

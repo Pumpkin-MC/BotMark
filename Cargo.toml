@@ -10,14 +10,14 @@ codegen-units = 1
 [dependencies]
 # log
 log = "0.4"
-simple_logger = "5.0.0"
+simple_logger = "5.1.0"
 # CLI
-clap = { version = "4.5.42", features = ["derive"] }
+clap = { version = "4.5.53", features = ["derive"] }
 # Networking
-tokio = { version = "1.47.1", features = ["net", "io-util"] }
+tokio = { version = "1.48.0", features = ["net", "io-util"] }
 pumpkin-protocol = { git = "https://github.com/Pumpkin-MC/Pumpkin", package = "pumpkin-protocol", default-features = false, features = ["serverbound", "clientbound"]}
 pumpkin-data = { git = "https://github.com/Pumpkin-MC/Pumpkin", package = "pumpkin-data"}
 
 crossbeam = "0.8.4"
-uuid = "1.17.0"
+uuid = "1.19.0"
 rand = "0.9"

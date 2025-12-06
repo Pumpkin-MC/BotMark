@@ -139,16 +139,15 @@ impl Client {
         if self.connection_state.load() != ConnectionState::Play {
             return;
         }
-        if let Some(spam_message) = spam_message.as_ref() {
-            if self
+        if let Some(spam_message) = spam_message.as_ref()
+            && self
                 .message_spam_cooldown
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
                 == 0
-            {
-                self.message_spam_cooldown
-                    .store(spam_message_delay, std::sync::atomic::Ordering::Relaxed);
-                self.send_message(spam_message.clone()).await
-            }
+        {
+            self.message_spam_cooldown
+                .store(spam_message_delay, std::sync::atomic::Ordering::Relaxed);
+            self.send_message(spam_message.clone()).await
         }
     }
 
