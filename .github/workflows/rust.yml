@@ -65,13 +65,13 @@ jobs:
         run: |
           mkdir -p dist
           if [ "${{ runner.os }}" == "Windows" ]; then EXT=".exe"; fi
-          cp "target/release/pumpkin$EXT" "dist/pumpkin-${{ runner.arch }}-${{ runner.os }}$EXT"
+          cp "target/release/botmark$EXT" "dist/botmark-${{ runner.arch }}-${{ runner.os }}$EXT"
       - name: Export executable
         uses: actions/upload-artifact@v4
         with:
-          name: pumpkin-${{ runner.arch }}-${{ runner.os }}
+          name: botmark-${{ runner.arch }}-${{ runner.os }}
           compression-level: 9
-          path: dist/pumpkin-*
+          path: dist/botmark-*
   clippy_release:
     name: Run lints in release mode
     runs-on: ubuntu-latest
