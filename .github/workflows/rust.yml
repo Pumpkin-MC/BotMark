@@ -60,12 +60,18 @@ jobs:
       - run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --verbose --release
+      - name: Prepare artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [ "${{ runner.os }}" == "Windows" ]; then EXT=".exe"; fi
+          cp "target/release/pumpkin$EXT" "dist/pumpkin-${{ runner.arch }}-${{ runner.os }}$EXT"
       - name: Export executable
         uses: actions/upload-artifact@v4
         with:
-          name: pumpkin-${{ matrix.os }}
+          name: pumpkin-${{ runner.arch }}-${{ runner.os }}
           compression-level: 9
-          path: target/${{ matrix.target }}/release/pumpkin*
+          path: dist/pumpkin-*
   clippy_release:
     name: Run lints in release mode
     runs-on: ubuntu-latest
