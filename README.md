@@ -1,7 +1,7 @@
 <div align="center">
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-![Current version)](https://img.shields.io/badge/current_version-1.21.10-blue)
+![Current version)](https://img.shields.io/badge/current_version-1.21.11-blue)
 
 A tool to stress test Minecraft servers by simulating numerous bot connections, helping identify performance bottlenecks and stability issues.
 ![Screenshot_20250223_154536](https://github.com/user-attachments/assets/b1379060-e375-44dc-95a3-91f1f2fb52dd)
@@ -40,7 +40,7 @@ Here's a detailed breakdown of all available command-line arguments:
   - Example: `--delay 500` (500 milliseconds delay)
   
 - **`--spam_message "<message>"` (Optional):**
-  - Will send a Chat message with the specefied `spam_message_delay`.
+  - Will send a Chat message with the specified `spam_message_delay`.
   - Example: `--spam_message "Hello, I'm a Robot"`
 
 - **`--spam_message_delay <delay>` (Optional, Default: `210`):**

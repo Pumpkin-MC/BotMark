@@ -19,6 +19,7 @@ use pumpkin_protocol::{
     ClientPacket, CompressionLevel, CompressionThreshold, ConnectionState, PacketDecodeError,
     RawPacket, ServerPacket,
 };
+use pumpkin_util::version::MinecraftVersion;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -174,7 +175,7 @@ impl Client {
     ) -> Result<(), WritingError> {
         let mut write = write;
         write.write_var_int(&VarInt(P::PACKET_ID))?;
-        packet.write_packet_data(write)
+        packet.write_packet_data(write, &MinecraftVersion::V_1_21_11)
     }
 
     /// Sends a clientbound packet to the connected client.
