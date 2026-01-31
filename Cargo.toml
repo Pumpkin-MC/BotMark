@@ -1,6 +1,6 @@
 [package]
 name = "botmark"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [profile.release]
@@ -12,7 +12,7 @@ codegen-units = 1
 log = "0.4"
 simple_logger = "5.1.0"
 # CLI
-clap = { version = "4.5.54", features = ["derive"] }
+clap = { version = "4.5.56", features = ["derive"] }
 # Networking
 tokio = { version = "1.49.0", features = ["net", "io-util"] }
 pumpkin-protocol = { git = "https://github.com/Pumpkin-MC/Pumpkin", package = "pumpkin-protocol", default-features = false, features = ["serverbound", "clientbound"]}
@@ -20,5 +20,5 @@ pumpkin-util = { git = "https://github.com/Pumpkin-MC/Pumpkin", package = "pumpk
 pumpkin-data = { git = "https://github.com/Pumpkin-MC/Pumpkin", package = "pumpkin-data"}
 
 crossbeam = "0.8.4"
-uuid = "1.19.0"
+uuid = "1.20.0"
 rand = { git = "https://github.com/rust-random/rand"}

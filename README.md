@@ -39,10 +39,22 @@ Here's a detailed breakdown of all available command-line arguments:
   - The timeout (in milliseconds) for each bot connection.
   - Example: `--delay 500` (500 milliseconds delay)
   
-- **`--spam_message "<message>"` (Optional):**
+- **`--spam_message "<message>"` (Optional, Default: `Please do not spam!`):**
   - Will send a Chat message with the specified `spam_message_delay`.
   - Example: `--spam_message "Hello, I'm a Robot"`
 
-- **`--spam_message_delay <delay>` (Optional, Default: `210`):**
-  - The delay (in milliseconds) between spam message.
-  - Example: `--spam_message_delay 100` (100 milliseconds delay)
+- **`--spam_message_delay_min <delay>` (Optional, Default: `150`):**
+  - The minimal delay (in milliseconds) between spam message.
+  - Example: `--spam_message_delay_min 100` (100 milliseconds delay)
+- **`--spam_message_delay_max <delay>` (Optional, Default: `350`):**
+  - The maximal delay (in milliseconds) between spam message.
+  - Example: `--spam_message_delay_max 100` (100 milliseconds delay)
+- **`--spam_message_delay_max <delay>` (Optional, Default: `350`):**
+  - The maximal delay (in milliseconds) between spam message.
+  - Example: `--spam_message_delay_max 100` (100 milliseconds delay)
+- **`--enable_rotation <false/true>` (Optional, Default: `true`):**
+  - Enable random head rotations.
+  - Example: `--enable_rotation true`
+- **`--enable_swing <false/true>` (Optional, Default: `true`):**
+  - Enable random arm swings.
+  - Example: `--enable_swing true`
