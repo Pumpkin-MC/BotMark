@@ -1,5 +1,4 @@
 use crossbeam::atomic::AtomicCell;
-use pumpkin_data::packet::CURRENT_MC_PROTOCOL;
 use pumpkin_protocol::codec::var_int::VarInt;
 use pumpkin_protocol::java::client::config::{CConfigDisconnect, CFinishConfig};
 use pumpkin_protocol::java::client::login::{
@@ -41,6 +40,8 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::Args;
+
+pub const VERSION: MinecraftVersion = MinecraftVersion::V_26_1;
 
 /// Everything which makes a Connection with our Server is a `Client`.
 #[expect(dead_code)]
@@ -387,8 +388,8 @@ impl Client {
         write: impl Write,
     ) -> Result<(), WritingError> {
         let mut write = write;
-        write.write_var_int(&VarInt(P::PACKET_ID.latest_id))?;
-        packet.write_packet_data(write, &MinecraftVersion::V_1_21_11)
+        write.write_var_int(&VarInt(P::to_id(VERSION)))?;
+        packet.write_packet_data(write, &VERSION)
     }
 
     /// Sends a clientbound packet to the connected client.
@@ -419,7 +420,7 @@ impl Client {
 
     pub async fn join_server(&self, address: SocketAddr, name: String) {
         self.send_packet(&SHandShake {
-            protocol_version: VarInt(CURRENT_MC_PROTOCOL as i32),
+            protocol_version: VarInt(VERSION.protocol_version()),
             server_address: address.ip().to_string(),
             server_port: address.port(),
             next_state: pumpkin_protocol::ConnectionState::Login,
@@ -448,20 +449,20 @@ impl Client {
     async fn handle_login_packet(&self, packet: &mut RawPacket) -> Result<(), ReadingError> {
         let bytebuf = &packet.payload[..];
         match packet.id {
-            id if id == CEncryptionRequest::PACKET_ID => {
+            id if id == CEncryptionRequest::to_id(VERSION) => {
                 todo!("Encryption is currently not implemented, please disable it at server level")
             }
-            id if id == CSetCompression::PACKET_ID => {
+            id if id == CSetCompression::to_id(VERSION) => {
                 log::trace!("Set Compression");
-                let packet = CSetCompression::read(bytebuf)?;
+                let packet = CSetCompression::read(bytebuf, &VERSION)?;
                 self.set_compression(Some((packet.threshold.0 as usize, 6)))
                     .await
             }
-            id if id == CLoginDisconnect::PACKET_ID => {
+            id if id == CLoginDisconnect::to_id(VERSION) => {
                 log::error!("Kicking in Login State");
                 self.close().await;
             }
-            id if id == CLoginSuccess::PACKET_ID => {
+            id if id == CLoginSuccess::to_id(VERSION) => {
                 log::trace!("Login -> Config");
                 self.send_packet(&SLoginAcknowledged).await;
                 self.connection_state.store(ConnectionState::Config);
@@ -478,11 +479,11 @@ impl Client {
 
     async fn handle_config_packet(&self, packet: &mut RawPacket) -> Result<(), ReadingError> {
         match packet.id {
-            id if id == CConfigDisconnect::PACKET_ID => {
+            id if id == CConfigDisconnect::to_id(VERSION) => {
                 log::error!("Kicking in Config State");
                 self.close().await;
             }
-            id if id == CFinishConfig::PACKET_ID => {
+            id if id == CFinishConfig::to_id(VERSION) => {
                 log::trace!("Config -> Play");
                 self.send_packet(&SAcknowledgeFinishConfig).await;
                 self.connection_state.store(ConnectionState::Play);
@@ -495,8 +496,8 @@ impl Client {
     async fn handle_play_packet(&self, packet: &mut RawPacket) -> Result<(), ReadingError> {
         let bytebuf = &packet.payload[..];
         match packet.id {
-            id if id == CKeepAlive::PACKET_ID => {
-                let packet = CKeepAlive::read(bytebuf)?;
+            id if id == CKeepAlive::to_id(VERSION) => {
+                let packet = CKeepAlive::read(bytebuf, &VERSION)?;
                 self.send_packet(&SKeepAlive {
                     keep_alive_id: packet.keep_alive_id,
                 })
@@ -512,8 +513,8 @@ impl Client {
             //         self.velocity_z.store(packet.velocity.0.z as f64 / 8000.0);
             //     }
             // }
-            id if id == CPlayerPosition::PACKET_ID => {
-                let packet = CPlayerPosition::read(bytebuf)?;
+            id if id == CPlayerPosition::to_id(VERSION) => {
+                let packet = CPlayerPosition::read(bytebuf, &VERSION)?;
                 self.current_yaw.store(packet.yaw);
                 self.current_pitch.store(packet.pitch);
 
@@ -539,14 +540,14 @@ impl Client {
                 .await;
                 self.is_loaded.store(true, Ordering::Relaxed);
             }
-            id if id == CLogin::PACKET_ID => {
+            id if id == CLogin::to_id(VERSION) => {
                 // TODO
                 // let packet = CLogin::read(bytebuf)?;
                 // self.entity_id.store(packet.entity_id, Ordering::Relaxed);
 
                 self.send_packet(&SPlayerLoaded).await;
             }
-            id if id == CPlayDisconnect::PACKET_ID => {
+            id if id == CPlayDisconnect::to_id(VERSION) => {
                 log::error!("Kicking in Play State");
                 self.close().await;
             }
