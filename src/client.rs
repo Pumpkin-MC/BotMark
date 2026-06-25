@@ -22,7 +22,7 @@ use pumpkin_protocol::{
     RawPacket, ServerPacket,
 };
 use pumpkin_util::math::vector3::Vector3;
-use pumpkin_util::version::MinecraftVersion;
+use pumpkin_util::version::JavaMinecraftVersion;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
@@ -41,7 +41,7 @@ use uuid::Uuid;
 
 use crate::Args;
 
-pub const VERSION: MinecraftVersion = MinecraftVersion::V_26_1;
+pub const VERSION: JavaMinecraftVersion = JavaMinecraftVersion::V_26_2;
 
 /// Everything which makes a Connection with our Server is a `Client`.
 #[expect(dead_code)]
@@ -372,7 +372,7 @@ impl Client {
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards");
         self.send_packet(&SChatMessage {
-            message,
+            message: message.into_boxed_str(),
             timestamp: since_the_epoch.as_millis() as i64,
             salt: rand::random(),
             signature: None,
@@ -421,14 +421,14 @@ impl Client {
     pub async fn join_server(&self, address: SocketAddr, name: String) {
         self.send_packet(&SHandShake {
             protocol_version: VarInt(VERSION.protocol_version()),
-            server_address: address.ip().to_string(),
+            server_address: address.ip().to_string().into_boxed_str(),
             server_port: address.port(),
             next_state: pumpkin_protocol::ConnectionState::Login,
         })
         .await;
         self.connection_state.store(ConnectionState::Login);
         self.send_packet(&SLoginStart {
-            name,
+            name: name.into_boxed_str(),
             uuid: Uuid::new_v4(),
         })
         .await;
