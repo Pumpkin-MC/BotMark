@@ -22,3 +22,9 @@ pumpkin-data = { git = "https://github.com/Pumpkin-MC/Pumpkin", package = "pumpk
 crossbeam = "0.8.4"
 uuid = "1.23.4"
 rand = { git = "https://github.com/rust-random/rand"}
+rsa = { version = "=0.10.0-rc.18", default-features = false, features = ["std", "encoding"] }
+
+[patch."https://github.com/Pumpkin-MC/Pumpkin"]
+pumpkin-protocol = { path = "../Pumpkin/crates/pumpkin-protocol" }
+pumpkin-util = { path = "../Pumpkin/crates/pumpkin-util" }
+pumpkin-data = { path = "../Pumpkin/crates/pumpkin-data" }

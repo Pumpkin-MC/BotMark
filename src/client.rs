@@ -1,28 +1,33 @@
 use crossbeam::atomic::AtomicCell;
+use pumpkin_protocol::codec::lp_vector_3d::LpVector3d;
 use pumpkin_protocol::codec::var_int::VarInt;
 use pumpkin_protocol::java::client::config::{CConfigDisconnect, CFinishConfig};
 use pumpkin_protocol::java::client::login::{
     CEncryptionRequest, CLoginDisconnect, CLoginSuccess, CSetCompression,
 };
-use pumpkin_protocol::java::client::play::{CKeepAlive, CLogin, CPlayDisconnect, CPlayerPosition};
+use pumpkin_protocol::java::client::play::{
+    CEntityVelocity, CKeepAlive, CLogin, CPlayDisconnect, CPlayerPosition,
+};
 use pumpkin_protocol::java::packet_decoder::TCPNetworkDecoder;
 use pumpkin_protocol::java::packet_encoder::TCPNetworkEncoder;
 use pumpkin_protocol::java::server::config::{SAcknowledgeFinishConfig, SKnownPacks};
 use pumpkin_protocol::java::server::handshake::SHandShake;
-use pumpkin_protocol::java::server::login::{SLoginAcknowledged, SLoginStart};
+use pumpkin_protocol::java::server::login::{SEncryptionResponse, SLoginAcknowledged, SLoginStart};
 use pumpkin_protocol::java::server::play::{
-    SChatMessage, SConfirmTeleport, SKeepAlive, SPlayerLoaded, SPlayerPosition, SPlayerRotation,
-    SSwingArm,
+    FLAG_ON_GROUND, SChatMessage, SConfirmTeleport, SKeepAlive, SPlayerLoaded, SPlayerPosition,
+    SPlayerPositionRotation, SPlayerRotation, SSetPlayerGround, SSwingArm,
 };
 use pumpkin_protocol::packet::MultiVersionJavaPacket;
 use pumpkin_protocol::ser::NetworkWriteExt;
-use pumpkin_protocol::ser::{ReadingError, WritingError};
+use pumpkin_protocol::ser::{NetworkReadExt, ReadingError, WritingError};
 use pumpkin_protocol::{
     ClientPacket, CompressionLevel, CompressionThreshold, ConnectionState, PacketDecodeError,
     RawPacket, ServerPacket,
 };
 use pumpkin_util::math::vector3::Vector3;
 use pumpkin_util::version::JavaMinecraftVersion;
+use rsa::pkcs8::DecodePublicKey;
+use rsa::{Pkcs1v15Encrypt, RsaPublicKey};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
@@ -44,7 +49,6 @@ use crate::Args;
 pub const VERSION: JavaMinecraftVersion = JavaMinecraftVersion::V_26_2;
 
 /// Everything which makes a Connection with our Server is a `Client`.
-#[expect(dead_code)]
 pub struct Client {
     /// The current connection state of the client (e.g., Handshaking, Status, Play).
     pub connection_state: AtomicCell<ConnectionState>,
@@ -62,33 +66,42 @@ pub struct Client {
     message_count: AtomicU32,
     is_loaded: AtomicBool,
     swing_cooldown: AtomicU32,
-    // Position
+
+    // Position & Physics
     current_x: AtomicCell<f64>,
     current_y: AtomicCell<f64>,
     current_z: AtomicCell<f64>,
+    ground_y: AtomicCell<f64>,
+    on_ground: AtomicBool,
 
     velocity_x: AtomicCell<f64>,
     velocity_y: AtomicCell<f64>,
     velocity_z: AtomicCell<f64>,
 
-    start_x: AtomicCell<f64>,
-    start_z: AtomicCell<f64>,
-    target_x: AtomicCell<f64>,
-    target_z: AtomicCell<f64>,
+    // Last sent position / rotation for delta synchronization
+    last_sent_x: AtomicCell<f64>,
+    last_sent_y: AtomicCell<f64>,
+    last_sent_z: AtomicCell<f64>,
+    last_sent_yaw: AtomicCell<f32>,
+    last_sent_pitch: AtomicCell<f32>,
+    last_sent_on_ground: AtomicBool,
+    ticks_since_last_sync: AtomicU32,
 
-    move_progress: AtomicCell<f32>,
+    // Movement AI
+    is_walking: AtomicBool,
+    move_ticks: AtomicU32,
     move_cooldown: AtomicU32,
+    move_dir_x: AtomicCell<f64>,
+    move_dir_z: AtomicCell<f64>,
+    jump_cooldown: AtomicU32,
 
     // Rotation
     current_yaw: AtomicCell<f32>,
     current_pitch: AtomicCell<f32>,
-    // Starting point of the movement
     start_yaw: AtomicCell<f32>,
     start_pitch: AtomicCell<f32>,
-    // Goal point
     target_yaw: AtomicCell<f32>,
     target_pitch: AtomicCell<f32>,
-    // Progress: 0.0 (start) to 1.0 (end)
     rotation_progress: AtomicCell<f32>,
     rotation_cooldown: AtomicU32,
 }
@@ -105,34 +118,50 @@ impl Client {
                 connection_reader,
             )))),
             entity_id: AtomicI32::new(0),
-            velocity_x: AtomicCell::new(0.0),
-            velocity_y: AtomicCell::new(0.0),
-            velocity_z: AtomicCell::new(0.0),
-
             closed: AtomicBool::new(false),
-            swing_cooldown: AtomicU32::new(0),
+            is_loaded: AtomicBool::new(false),
             close_interrupt: Arc::new(Notify::new()),
+
             message_spam_cooldown: AtomicU32::new(1),
             message_count: AtomicU32::new(0),
-            is_loaded: AtomicBool::new(false),
-            rotation_cooldown: AtomicU32::new(0),
-            rotation_progress: AtomicCell::new(1.0),
+            swing_cooldown: AtomicU32::new(0),
+
+            // Rotation
             current_yaw: AtomicCell::new(0.0),
             current_pitch: AtomicCell::new(0.0),
             start_yaw: AtomicCell::new(0.0),
             start_pitch: AtomicCell::new(0.0),
             target_yaw: AtomicCell::new(0.0),
             target_pitch: AtomicCell::new(0.0),
+            rotation_progress: AtomicCell::new(1.0),
+            rotation_cooldown: AtomicU32::new(0),
 
+            // Position & Physics
             current_x: AtomicCell::new(0.0),
             current_y: AtomicCell::new(0.0),
             current_z: AtomicCell::new(0.0),
-            start_x: AtomicCell::new(0.0),
-            start_z: AtomicCell::new(0.0),
-            target_x: AtomicCell::new(0.0),
-            target_z: AtomicCell::new(0.0),
-            move_progress: AtomicCell::new(1.0),
+            ground_y: AtomicCell::new(0.0),
+            on_ground: AtomicBool::new(true),
+
+            velocity_x: AtomicCell::new(0.0),
+            velocity_y: AtomicCell::new(0.0),
+            velocity_z: AtomicCell::new(0.0),
+
+            last_sent_x: AtomicCell::new(0.0),
+            last_sent_y: AtomicCell::new(0.0),
+            last_sent_z: AtomicCell::new(0.0),
+            last_sent_yaw: AtomicCell::new(0.0),
+            last_sent_pitch: AtomicCell::new(0.0),
+            last_sent_on_ground: AtomicBool::new(true),
+            ticks_since_last_sync: AtomicU32::new(0),
+
+            // Movement AI
+            is_walking: AtomicBool::new(false),
+            move_ticks: AtomicU32::new(0),
             move_cooldown: AtomicU32::new(0),
+            move_dir_x: AtomicCell::new(0.0),
+            move_dir_z: AtomicCell::new(0.0),
+            jump_cooldown: AtomicU32::new(0),
         }
     }
 
@@ -157,6 +186,16 @@ impl Client {
                 .lock()
                 .await
                 .set_compression(compression);
+        }
+    }
+
+    /// Enables AES-128 CFB8 encryption for the connection using the shared secret.
+    pub async fn set_encryption(&self, key: &[u8; 16]) {
+        if let Err(err) = self.network_reader.lock().await.set_encryption(key) {
+            log::error!("Failed to set decoder encryption: {err}");
+        }
+        if let Err(err) = self.network_writer.lock().await.set_encryption(key) {
+            log::error!("Failed to set encoder encryption: {err}");
         }
     }
 
@@ -203,7 +242,6 @@ impl Client {
         true
     }
 
-    // TODO: make this less ugly ig
     pub async fn tick(&self, args: &Args) {
         if self.connection_state.load() != ConnectionState::Play {
             return;
@@ -228,17 +266,93 @@ impl Client {
                 },
             );
             if let Ok(0) = result {
-                self.send_message(spam_message.clone()).await;
+                self.send_message(spam_message).await;
             }
+        }
+
+        if args.enable_swing {
+            self.tick_swing().await;
+        }
+
+        if args.enable_movement {
+            self.tick_movement_ai(args).await;
         }
 
         if args.enable_rotation {
             self.tick_rotation().await;
         }
-        if args.enable_swing {
-            self.tick_swing().await;
+
+        if args.enable_physics {
+            self.tick_physics().await;
         }
-        //self.tick_movement().await
+
+        self.sync_movement().await;
+    }
+
+    async fn tick_movement_ai(&self, args: &Args) {
+        let is_walking = self.is_walking.load(Ordering::Relaxed);
+        let on_ground = self.on_ground.load(Ordering::Relaxed);
+
+        if is_walking {
+            let ticks = self.move_ticks.fetch_sub(1, Ordering::Relaxed);
+            let dir_x = self.move_dir_x.load();
+            let dir_z = self.move_dir_z.load();
+
+            // Walking acceleration (stronger on ground, slight in air)
+            let accel = if on_ground { 0.08 } else { 0.02 };
+            let vx = self.velocity_x.load() + dir_x * accel;
+            let vz = self.velocity_z.load() + dir_z * accel;
+            self.velocity_x.store(vx);
+            self.velocity_z.store(vz);
+
+            // Jumping behavior while moving
+            if args.enable_jumping {
+                let jump_cd = self.jump_cooldown.load(Ordering::Relaxed);
+                if jump_cd == 0 && on_ground && rand::random_bool(0.04) {
+                    self.velocity_y.store(0.42);
+                    self.on_ground.store(false, Ordering::Relaxed);
+                    self.jump_cooldown
+                        .store(rand::random_range(15..40), Ordering::Relaxed);
+                } else if jump_cd > 0 {
+                    self.jump_cooldown.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+
+            if ticks <= 1 {
+                self.is_walking.store(false, Ordering::Relaxed);
+                self.move_cooldown
+                    .store(rand::random_range(20..80), Ordering::Relaxed);
+            }
+        } else {
+            let cd = self.move_cooldown.load(Ordering::Relaxed);
+            if cd == 0 {
+                // Pick a new random angle and start walking
+                let angle = rand::random_range(-std::f64::consts::PI..std::f64::consts::PI);
+                let dir_x = -angle.sin();
+                let dir_z = angle.cos();
+
+                self.move_dir_x.store(dir_x);
+                self.move_dir_z.store(dir_z);
+                self.move_ticks
+                    .store(rand::random_range(20..60), Ordering::Relaxed);
+                self.is_walking.store(true, Ordering::Relaxed);
+
+                if args.enable_rotation {
+                    self.start_yaw.store(self.current_yaw.load());
+                    self.start_pitch.store(self.current_pitch.load());
+                    self.target_yaw.store(angle.to_degrees() as f32);
+                    self.target_pitch.store(rand::random_range(-10.0..10.0));
+                    self.rotation_progress.store(0.0);
+                }
+            } else {
+                self.move_cooldown.fetch_sub(1, Ordering::Relaxed);
+            }
+
+            let jump_cd = self.jump_cooldown.load(Ordering::Relaxed);
+            if jump_cd > 0 {
+                self.jump_cooldown.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
     }
 
     async fn tick_rotation(&self) {
@@ -246,108 +360,172 @@ impl Client {
         let cooldown = self.rotation_cooldown.load(Ordering::Relaxed);
 
         if progress >= 1.0 {
-            // We have finished the movement. Wait for the cooldown.
             if cooldown == 0 {
-                // Pick a new target and reset
-                let current_y = self.current_yaw.load();
-                let current_p = self.current_pitch.load();
+                if !self.is_walking.load(Ordering::Relaxed) {
+                    let current_y = self.current_yaw.load();
+                    let current_p = self.current_pitch.load();
 
-                self.start_yaw.store(current_y);
-                self.start_pitch.store(current_p);
-                self.target_yaw.store(rand::random_range(-180.0..180.0));
-                self.target_pitch.store(rand::random_range(-90.0..90.0));
+                    self.start_yaw.store(current_y);
+                    self.start_pitch.store(current_p);
+                    self.target_yaw.store(rand::random_range(-180.0..180.0));
+                    self.target_pitch.store(rand::random_range(-30.0..30.0));
 
-                self.rotation_progress.store(0.0);
-                // Wait for 2-5 seconds (40-100 ticks) before moving again
-                self.rotation_cooldown
-                    .store(rand::random_range(40..100), Ordering::Relaxed);
+                    self.rotation_progress.store(0.0);
+                    self.rotation_cooldown
+                        .store(rand::random_range(40..100), Ordering::Relaxed);
+                }
             } else {
                 self.rotation_cooldown.fetch_sub(1, Ordering::Relaxed);
             }
         } else {
-            // Increment progress (e.g., 0.02 means it takes 50 ticks/2.5s to complete turn)
-            let new_progress = (progress + 0.02).min(1.0);
+            let new_progress = (progress + 0.05).min(1.0);
             self.rotation_progress.store(new_progress);
 
-            // Calculate the "Smooth" T value using the S-Curve formula
-            // t = 3p^2 - 2p^3
+            // S-Curve interpolation
             let t = 3.0 * new_progress.powi(2) - 2.0 * new_progress.powi(3);
 
-            // Interpolate: start + (target - start) * t
             let start_y = self.start_yaw.load();
             let target_y = self.target_yaw.load();
-            let interpolated_yaw = start_y + (target_y - start_y) * t;
+            let mut diff_y = (target_y - start_y) % 360.0;
+            if diff_y > 180.0 {
+                diff_y -= 360.0;
+            } else if diff_y < -180.0 {
+                diff_y += 360.0;
+            }
+            let interpolated_yaw = (start_y + diff_y * t) % 360.0;
 
             let start_p = self.start_pitch.load();
             let target_p = self.target_pitch.load();
-            let interpolated_pitch = start_p + (target_p - start_p) * t;
+            let interpolated_pitch = (start_p + (target_p - start_p) * t).clamp(-90.0, 90.0);
 
             self.current_yaw.store(interpolated_yaw);
             self.current_pitch.store(interpolated_pitch);
-
-            // Send rotation packet
-            self.send_packet(&SPlayerRotation {
-                yaw: interpolated_yaw,
-                pitch: interpolated_pitch,
-                ground: true,
-            })
-            .await;
         }
     }
 
-    #[expect(dead_code)]
-    async fn tick_movement(&self) {
-        let progress = self.move_progress.load();
-        let cooldown = self.move_cooldown.load(Ordering::Relaxed);
+    async fn tick_physics(&self) {
+        let mut vx = self.velocity_x.load();
+        let mut vy = self.velocity_y.load();
+        let mut vz = self.velocity_z.load();
 
-        if progress >= 1.0 {
-            if cooldown == 0 {
-                // Start a new walk
-                let cur_x = self.current_x.load();
-                let cur_z = self.current_z.load();
+        let cur_x = self.current_x.load();
+        let cur_y = self.current_y.load();
+        let cur_z = self.current_z.load();
+        let ground_y = self.ground_y.load();
+        let on_ground = self.on_ground.load(Ordering::Relaxed);
 
-                self.start_x.store(cur_x);
-                self.start_z.store(cur_z);
+        // 1. Gravity and vertical drag
+        if !on_ground {
+            vy = (vy - 0.08) * 0.98;
+        } else if vy < 0.0 {
+            vy = 0.0;
+        }
 
-                // Small random walk (0.5 to 1.5 blocks)
-                let offset_x = rand::random_range(-1.5..1.5);
-                let offset_z = rand::random_range(-1.5..1.5);
+        // 2. Horizontal friction & air resistance
+        let friction = if on_ground { 0.6 * 0.91 } else { 0.91 };
+        vx *= friction;
+        vz *= friction;
 
-                self.target_x.store(cur_x + offset_x);
-                self.target_z.store(cur_z + offset_z);
+        if vx.abs() < 1e-4 {
+            vx = 0.0;
+        }
+        if vz.abs() < 1e-4 {
+            vz = 0.0;
+        }
+        if vy.abs() < 1e-4 && on_ground {
+            vy = 0.0;
+        }
 
-                self.move_progress.store(0.0);
-                // Wait 2-5 seconds between moves
-                self.move_cooldown
-                    .store(rand::random_range(40..100), Ordering::Relaxed);
-            } else {
-                self.move_cooldown.fetch_sub(1, Ordering::Relaxed);
-            }
+        // 3. Integrate position
+        let new_x = cur_x + vx;
+        let mut new_y = cur_y + vy;
+        let new_z = cur_z + vz;
+
+        // 4. Ground collision
+        let new_on_ground = if new_y <= ground_y {
+            new_y = ground_y;
+            vy = 0.0;
+            true
         } else {
-            // Increase this to 0.05 for a normal human walking pace (20 ticks to finish)
-            let new_progress = (progress + 0.05).min(1.0);
-            self.move_progress.store(new_progress);
+            false
+        };
 
-            // Cubic easing for a natural start/stop
-            let t = 3.0 * new_progress.powi(2) - 2.0 * new_progress.powi(3);
+        self.velocity_x.store(vx);
+        self.velocity_y.store(vy);
+        self.velocity_z.store(vz);
 
-            let start_x = self.start_x.load();
-            let target_x = self.target_x.load();
-            let start_z = self.start_z.load();
-            let target_z = self.target_z.load();
+        self.current_x.store(new_x);
+        self.current_y.store(new_y);
+        self.current_z.store(new_z);
+        self.on_ground.store(new_on_ground, Ordering::Relaxed);
+    }
 
-            let interp_x = start_x + (target_x - start_x) * t as f64;
-            let interp_z = start_z + (target_z - start_z) * t as f64;
+    async fn sync_movement(&self) {
+        let cur_x = self.current_x.load();
+        let cur_y = self.current_y.load();
+        let cur_z = self.current_z.load();
+        let cur_yaw = self.current_yaw.load();
+        let cur_pitch = self.current_pitch.load();
+        let cur_on_ground = self.on_ground.load(Ordering::Relaxed);
 
-            self.current_x.store(interp_x);
-            self.current_z.store(interp_z);
+        let last_x = self.last_sent_x.load();
+        let last_y = self.last_sent_y.load();
+        let last_z = self.last_sent_z.load();
+        let last_yaw = self.last_sent_yaw.load();
+        let last_pitch = self.last_sent_pitch.load();
+        let last_on_ground = self.last_sent_on_ground.load(Ordering::Relaxed);
 
-            self.send_packet(&SPlayerPosition {
-                position: Vector3::new(interp_x, self.current_y.load(), interp_z),
-                collision: 1, // on_ground
+        let pos_changed = (cur_x - last_x).abs() > 1e-4
+            || (cur_y - last_y).abs() > 1e-4
+            || (cur_z - last_z).abs() > 1e-4;
+
+        let rot_changed =
+            (cur_yaw - last_yaw).abs() > 0.01 || (cur_pitch - last_pitch).abs() > 0.01;
+
+        let ground_changed = cur_on_ground != last_on_ground;
+        let ticks_since_sync = self.ticks_since_last_sync.fetch_add(1, Ordering::Relaxed);
+
+        let collision = if cur_on_ground { FLAG_ON_GROUND } else { 0 };
+
+        if pos_changed && rot_changed {
+            self.send_packet(&SPlayerPositionRotation {
+                position: Vector3::new(cur_x, cur_y, cur_z),
+                yaw: cur_yaw,
+                pitch: cur_pitch,
+                collision,
             })
             .await;
+            self.ticks_since_last_sync.store(0, Ordering::Relaxed);
+        } else if pos_changed {
+            self.send_packet(&SPlayerPosition {
+                position: Vector3::new(cur_x, cur_y, cur_z),
+                collision,
+            })
+            .await;
+            self.ticks_since_last_sync.store(0, Ordering::Relaxed);
+        } else if rot_changed {
+            self.send_packet(&SPlayerRotation {
+                yaw: cur_yaw,
+                pitch: cur_pitch,
+                ground: cur_on_ground,
+            })
+            .await;
+            self.ticks_since_last_sync.store(0, Ordering::Relaxed);
+        } else if ground_changed || ticks_since_sync >= 20 {
+            self.send_packet(&SSetPlayerGround {
+                on_ground: cur_on_ground,
+            })
+            .await;
+            self.ticks_since_last_sync.store(0, Ordering::Relaxed);
         }
+
+        self.last_sent_x.store(cur_x);
+        self.last_sent_y.store(cur_y);
+        self.last_sent_z.store(cur_z);
+        self.last_sent_yaw.store(cur_yaw);
+        self.last_sent_pitch.store(cur_pitch);
+        self.last_sent_on_ground
+            .store(cur_on_ground, Ordering::Relaxed);
     }
 
     async fn tick_swing(&self) {
@@ -365,19 +543,19 @@ impl Client {
         }
     }
 
-    pub async fn send_message(&self, message: String) {
+    pub async fn send_message(&self, message: &str) {
         let count = self.message_count.fetch_add(1, Ordering::SeqCst);
         let start = SystemTime::now();
         let since_the_epoch = start
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards");
         self.send_packet(&SChatMessage {
-            message: message.into_boxed_str(),
+            message,
             timestamp: since_the_epoch.as_millis() as i64,
             salt: rand::random(),
             signature: None,
             message_count: VarInt(count as i32),
-            acknowledged: vec![0; 20].into_boxed_slice(),
+            acknowledged: &[0; 3],
             checksum: 0,
         })
         .await;
@@ -401,20 +579,21 @@ impl Client {
         let mut packet_buf = Vec::new();
         let writer = &mut packet_buf;
         Self::write_packet(packet, writer).unwrap();
-        if let Err(err) = self
-            .network_writer
-            .lock()
-            .await
-            .write_packet(packet_buf.into())
-            .await
+        let mut encoder = self.network_writer.lock().await;
+        if let Err(err) = encoder.write_packet(packet_buf.into()).await
+            && !self.closed.load(Ordering::Relaxed)
         {
-            // It is expected that the packet will fail if we are closed
-            if !self.closed.load(Ordering::Relaxed) {
-                log::warn!("Failed to send packet to client: {err}");
-                // We now need to close the connection to the client since the stream is in an
-                // unknown state
-                self.close().await;
-            }
+            log::warn!("Failed to send packet to server: {err}");
+            // We now need to close the connection to the client since the stream is in an
+            // unknown state
+            self.close().await;
+            return;
+        }
+        if let Err(err) = encoder.flush().await
+            && !self.closed.load(Ordering::Relaxed)
+        {
+            log::warn!("Failed to flush packet to server: {err}");
+            self.close().await;
         }
     }
 
@@ -447,14 +626,45 @@ impl Client {
     }
 
     async fn handle_login_packet(&self, packet: &mut RawPacket) -> Result<(), ReadingError> {
-        let bytebuf = &packet.payload[..];
+        let mut bytebuf = &packet.payload[..];
         match packet.id {
             id if id == CEncryptionRequest::to_id(VERSION) => {
-                todo!("Encryption is currently not implemented, please disable it at server level")
+                log::trace!("Handling Encryption Request");
+                let packet = CEncryptionRequest::read(&mut bytebuf, &VERSION)?;
+                let shared_secret: [u8; 16] = rand::random();
+
+                let public_key =
+                    RsaPublicKey::from_public_key_der(packet.public_key).map_err(|e| {
+                        ReadingError::Message(format!("Failed to parse RSA public key: {e}"))
+                    })?;
+
+                let (encrypted_shared_secret, encrypted_verify_token) = {
+                    let mut rng = rand::rng();
+                    let enc_secret = public_key
+                        .encrypt(&mut rng, Pkcs1v15Encrypt, &shared_secret)
+                        .map_err(|e| {
+                            ReadingError::Message(format!("Failed to encrypt shared secret: {e}"))
+                        })?;
+                    let enc_token = public_key
+                        .encrypt(&mut rng, Pkcs1v15Encrypt, packet.verify_token)
+                        .map_err(|e| {
+                            ReadingError::Message(format!("Failed to encrypt verify token: {e}"))
+                        })?;
+                    (enc_secret, enc_token)
+                };
+
+                self.send_packet(&SEncryptionResponse {
+                    shared_secret: encrypted_shared_secret.into_boxed_slice(),
+                    verify_token: encrypted_verify_token.into_boxed_slice(),
+                })
+                .await;
+
+                self.set_encryption(&shared_secret).await;
+                log::trace!("Encryption enabled successfully");
             }
             id if id == CSetCompression::to_id(VERSION) => {
                 log::trace!("Set Compression");
-                let packet = CSetCompression::read(bytebuf, &VERSION)?;
+                let packet = CSetCompression::read(&mut bytebuf, &VERSION)?;
                 self.set_compression(Some((packet.threshold.0 as usize, 6)))
                     .await
             }
@@ -468,7 +678,7 @@ impl Client {
                 self.connection_state.store(ConnectionState::Config);
                 log::trace!("Sending Known packs");
                 self.send_packet(&SKnownPacks {
-                    known_pack_count: VarInt(0),
+                    known_packs: Vec::new(),
                 })
                 .await;
             }
@@ -494,29 +704,34 @@ impl Client {
     }
 
     async fn handle_play_packet(&self, packet: &mut RawPacket) -> Result<(), ReadingError> {
-        let bytebuf = &packet.payload[..];
+        let mut bytebuf = &packet.payload[..];
         match packet.id {
             id if id == CKeepAlive::to_id(VERSION) => {
-                let packet = CKeepAlive::read(bytebuf, &VERSION)?;
+                let packet = CKeepAlive::read(&mut bytebuf, &VERSION)?;
                 self.send_packet(&SKeepAlive {
                     keep_alive_id: packet.keep_alive_id,
                 })
                 .await;
             }
-            // TODO
-            // id if id == CEntityVelocity::PACKET_ID => {
-            // let packet = CEntityVelocity::read(bytebuf)?;
-
-            //     if packet.entity_id.0 == self.entity_id.load(Ordering::Relaxed) as i32 {
-            //         self.velocity_x.store(packet.velocity.0.x as f64 / 8000.0);
-            //         self.velocity_y.store(packet.velocity.0.y as f64 / 8000.0);
-            //         self.velocity_z.store(packet.velocity.0.z as f64 / 8000.0);
-            //     }
-            // }
+            id if id == CEntityVelocity::to_id(VERSION) => {
+                let entity_id = bytebuf.get_var_int()?;
+                if entity_id.0 == self.entity_id.load(Ordering::Relaxed) {
+                    let velocity = LpVector3d::read(&mut bytebuf)?.0;
+                    self.velocity_x.store(velocity.x);
+                    self.velocity_y.store(velocity.y);
+                    self.velocity_z.store(velocity.z);
+                    if velocity.y > 0.0 {
+                        self.on_ground.store(false, Ordering::Relaxed);
+                    }
+                }
+            }
             id if id == CPlayerPosition::to_id(VERSION) => {
-                let packet = CPlayerPosition::read(bytebuf, &VERSION)?;
+                let packet = CPlayerPosition::read(&mut bytebuf, &VERSION)?;
                 self.current_yaw.store(packet.yaw);
                 self.current_pitch.store(packet.pitch);
+                self.target_yaw.store(packet.yaw);
+                self.target_pitch.store(packet.pitch);
+                self.rotation_progress.store(1.0);
 
                 let x = packet.position.x;
                 let y = packet.position.y;
@@ -525,15 +740,26 @@ impl Client {
                 self.current_x.store(x);
                 self.current_y.store(y);
                 self.current_z.store(z);
+                self.ground_y.store(y);
 
-                self.start_x.store(x);
-                self.start_z.store(z);
-                self.target_x.store(x);
-                self.target_z.store(z);
+                self.velocity_x.store(packet.delta.x);
+                self.velocity_y.store(packet.delta.y);
+                self.velocity_z.store(packet.delta.z);
 
-                self.move_progress.store(1.0);
+                let on_ground = packet.delta.y <= 0.0;
+                self.on_ground.store(on_ground, Ordering::Relaxed);
+
+                self.last_sent_x.store(x);
+                self.last_sent_y.store(y);
+                self.last_sent_z.store(z);
+                self.last_sent_yaw.store(packet.yaw);
+                self.last_sent_pitch.store(packet.pitch);
+                self.last_sent_on_ground.store(on_ground, Ordering::Relaxed);
+
+                self.is_walking.store(false, Ordering::Relaxed);
                 self.move_cooldown
-                    .store(rand::random_range(40..100), Ordering::Relaxed);
+                    .store(rand::random_range(20..60), Ordering::Relaxed);
+
                 self.send_packet(&SConfirmTeleport {
                     teleport_id: packet.teleport_id,
                 })
@@ -541,10 +767,8 @@ impl Client {
                 self.is_loaded.store(true, Ordering::Relaxed);
             }
             id if id == CLogin::to_id(VERSION) => {
-                // TODO
-                // let packet = CLogin::read(bytebuf)?;
-                // self.entity_id.store(packet.entity_id, Ordering::Relaxed);
-
+                let entity_id = bytebuf.get_i32_be()?;
+                self.entity_id.store(entity_id, Ordering::Relaxed);
                 self.send_packet(&SPlayerLoaded).await;
             }
             id if id == CPlayDisconnect::to_id(VERSION) => {
@@ -560,5 +784,182 @@ impl Client {
         self.close_interrupt.notify_waiters();
         self.closed
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    async fn create_test_client() -> Client {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _ = server_stream;
+        let client_stream = connect_handle.await.unwrap();
+        Client::new(client_stream)
+    }
+
+    #[tokio::test]
+    async fn test_gravity_and_ground_collision() {
+        let client = create_test_client().await;
+        client.current_y.store(10.0);
+        client.ground_y.store(0.0);
+        client.on_ground.store(false, Ordering::Relaxed);
+
+        // Tick physics multiple times in the air
+        for _ in 0..10 {
+            client.tick_physics().await;
+        }
+
+        // The bot should have fallen down and velocity.y should be negative
+        assert!(client.current_y.load() < 10.0);
+        assert!(client.velocity_y.load() < 0.0);
+
+        // Tick until it lands
+        for _ in 0..50 {
+            client.tick_physics().await;
+        }
+
+        assert_eq!(client.current_y.load(), 0.0);
+        assert_eq!(client.velocity_y.load(), 0.0);
+        assert!(client.on_ground.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_jump_physics() {
+        let client = create_test_client().await;
+        client.current_y.store(0.0);
+        client.ground_y.store(0.0);
+        client.on_ground.store(true, Ordering::Relaxed);
+
+        // Apply jump impulse
+        client.velocity_y.store(0.42);
+        client.on_ground.store(false, Ordering::Relaxed);
+
+        client.tick_physics().await;
+        assert!(client.current_y.load() > 0.0);
+        assert!(!client.on_ground.load(Ordering::Relaxed));
+
+        // Tick until landing back on ground
+        for _ in 0..50 {
+            client.tick_physics().await;
+        }
+
+        assert_eq!(client.current_y.load(), 0.0);
+        assert!(client.on_ground.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_horizontal_friction_decay() {
+        let client = create_test_client().await;
+        client.current_y.store(0.0);
+        client.ground_y.store(0.0);
+        client.on_ground.store(true, Ordering::Relaxed);
+
+        client.velocity_x.store(1.0);
+        client.tick_physics().await;
+
+        let vx = client.velocity_x.load();
+        assert!(vx < 1.0);
+        assert!((vx - 0.546).abs() < 1e-3);
+    }
+
+    #[tokio::test]
+    async fn test_encryption_handshake_and_encrypted_stream() {
+        use rsa::RsaPrivateKey;
+        use rsa::pkcs8::EncodePublicKey;
+
+        let mut rng = rand::rng();
+        let server_private_key = RsaPrivateKey::new(&mut rng, 1024).unwrap();
+        let server_public_key_der = server_private_key
+            .to_public_key()
+            .to_public_key_der()
+            .unwrap()
+            .into_vec();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let connect_handle = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let client = Arc::new(Client::new(stream));
+            client.connection_state.store(ConnectionState::Login);
+            client
+        });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let client = connect_handle.await.unwrap();
+
+        let (server_reader, server_writer) = server_stream.into_split();
+        let mut server_decoder = TCPNetworkDecoder::new(BufReader::new(server_reader));
+        let mut server_encoder = TCPNetworkEncoder::new(BufWriter::new(server_writer));
+
+        // 1. Server sends CEncryptionRequest
+        let verify_token = [1u8, 2, 3, 4];
+        let enc_req = CEncryptionRequest::new("", &server_public_key_der, &verify_token, false);
+        let mut enc_req_buf = Vec::new();
+        Client::write_packet(&enc_req, &mut enc_req_buf).unwrap();
+        server_encoder
+            .write_packet(enc_req_buf.into())
+            .await
+            .unwrap();
+        server_encoder.flush().await.unwrap();
+
+        // 2. Client processes the packet (CEncryptionRequest -> SEncryptionResponse + enables encryption)
+        let client_clone = client.clone();
+        let client_process_handle =
+            tokio::spawn(async move { client_clone.process_packets().await });
+
+        // 3. Server receives SEncryptionResponse (unencrypted)
+        let raw_resp = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_resp.id, SEncryptionResponse::to_id(VERSION));
+        let mut resp_payload = &raw_resp.payload[..];
+        let resp = SEncryptionResponse::read(&mut resp_payload, &VERSION).unwrap();
+
+        // 4. Server decrypts shared secret and verify token
+        let decrypted_secret = server_private_key
+            .decrypt(Pkcs1v15Encrypt, &resp.shared_secret)
+            .unwrap();
+        let decrypted_token = server_private_key
+            .decrypt(Pkcs1v15Encrypt, &resp.verify_token)
+            .unwrap();
+
+        assert_eq!(decrypted_token.as_slice(), &verify_token);
+        assert_eq!(decrypted_secret.len(), 16);
+
+        let shared_secret: [u8; 16] = decrypted_secret.try_into().unwrap();
+
+        // 5. Server enables encryption
+        server_decoder.set_encryption(&shared_secret).unwrap();
+        server_encoder.set_encryption(&shared_secret).unwrap();
+
+        assert!(client_process_handle.await.unwrap());
+
+        // 6. Test encrypted communication: Server sends encrypted CKeepAlive
+        let keep_alive = CKeepAlive {
+            keep_alive_id: 123456,
+        };
+        let mut ka_buf = Vec::new();
+        Client::write_packet(&keep_alive, &mut ka_buf).unwrap();
+        server_encoder.write_packet(ka_buf.into()).await.unwrap();
+        server_encoder.flush().await.unwrap();
+
+        // 7. Client receives and handles encrypted CKeepAlive, sends encrypted SKeepAlive back
+        client.connection_state.store(ConnectionState::Play);
+        let client_clone = client.clone();
+        let client_process_handle =
+            tokio::spawn(async move { client_clone.process_packets().await });
+
+        // 8. Server reads encrypted SKeepAlive from client
+        let raw_ka_resp = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_ka_resp.id, SKeepAlive::to_id(VERSION));
+        let mut ka_resp_payload = &raw_ka_resp.payload[..];
+        let ka_resp = SKeepAlive::read(&mut ka_resp_payload, &VERSION).unwrap();
+        assert_eq!(ka_resp.keep_alive_id, 123456);
+
+        assert!(client_process_handle.await.unwrap());
     }
 }

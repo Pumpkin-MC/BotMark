@@ -46,15 +46,21 @@ Here's a detailed breakdown of all available command-line arguments:
 - **`--spam_message_delay_min <delay>` (Optional, Default: `150`):**
   - The minimal delay (in milliseconds) between spam message.
   - Example: `--spam_message_delay_min 100` (100 milliseconds delay)
-- **`--spam_message_delay_max <delay>` (Optional, Default: `350`):**
+- **`--spam_message_delay_max <delay>` (Optional, Default: `250`):**
   - The maximal delay (in milliseconds) between spam message.
-  - Example: `--spam_message_delay_max 100` (100 milliseconds delay)
-- **`--spam_message_delay_max <delay>` (Optional, Default: `350`):**
-  - The maximal delay (in milliseconds) between spam message.
-  - Example: `--spam_message_delay_max 100` (100 milliseconds delay)
+  - Example: `--spam_message_delay_max 250` (250 milliseconds delay)
 - **`--enable_rotation <false/true>` (Optional, Default: `true`):**
   - Enable random head rotations.
   - Example: `--enable_rotation true`
 - **`--enable_swing <false/true>` (Optional, Default: `true`):**
   - Enable random arm swings.
   - Example: `--enable_swing true`
+- **`--enable_movement <false/true>` (Optional, Default: `true`):**
+  - Enable random bot movement and walking.
+  - Example: `--enable_movement true`
+- **`--enable_jumping <false/true>` (Optional, Default: `true`):**
+  - Enable jumping while moving.
+  - Example: `--enable_jumping true`
+- **`--enable_physics <false/true>` (Optional, Default: `true`):**
+  - Enable physics simulation (gravity, friction, inertia, server knockback).
+  - Example: `--enable_physics true`

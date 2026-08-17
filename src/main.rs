@@ -29,6 +29,12 @@ pub struct Args {
     pub enable_rotation: bool,
     #[arg(long, default_value_t = true)]
     pub enable_swing: bool,
+    #[arg(long, default_value_t = true)]
+    pub enable_movement: bool,
+    #[arg(long, default_value_t = true)]
+    pub enable_jumping: bool,
+    #[arg(long, default_value_t = true)]
+    pub enable_physics: bool,
 }
 
 #[tokio::main]
@@ -62,7 +68,7 @@ async fn main() {
                     "Bot {} connection to {} timed out after {}ms",
                     i + 1,
                     address,
-                    bot_count
+                    args.timeout
                 );
                 continue;
             }
@@ -72,7 +78,7 @@ async fn main() {
         client.join_server(address, format!("BOT_{i}")).await;
         let cloned_args = args.clone();
         let join_handle = tokio::spawn(async move {
-            let mut tick_interval = tokio::time::interval(Duration::from_millis(5));
+            let mut tick_interval = tokio::time::interval(Duration::from_millis(50));
             tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
