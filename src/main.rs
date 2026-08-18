@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, sync::atomic::Ordering, time::Duration};
 
 use clap::Parser;
 use client::Client;
@@ -77,21 +77,25 @@ async fn main() {
 
         client.join_server(address, format!("BOT_{i}")).await;
         let cloned_args = args.clone();
-        let join_handle = tokio::spawn(async move {
+        let client_tick = client.clone();
+        let tick_handle = tokio::spawn(async move {
             let mut tick_interval = tokio::time::interval(Duration::from_millis(50));
             tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    res = client.process_packets() => {
-                        if !res { break; }
-                    }
-                    _ = tick_interval.tick() => {
-                        client.tick(&cloned_args).await;
-                    }
-                }
+            while !client_tick.closed.load(Ordering::Relaxed) {
+                tick_interval.tick().await;
+                client_tick.tick(&cloned_args).await;
             }
         });
-        join_handles.push(join_handle);
+
+        let client_proc = client.clone();
+        let proc_handle = tokio::spawn(async move {
+            while client_proc.process_packets().await {
+                // Keep reading and processing incoming packets without cancellation
+            }
+        });
+
+        join_handles.push(tick_handle);
+        join_handles.push(proc_handle);
         log::info!("{}/{} Bots Joined", i + 1, bot_count);
     }
     // Graceful shutdown on Ctrl+C

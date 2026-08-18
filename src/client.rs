@@ -6,7 +6,8 @@ use pumpkin_protocol::java::client::login::{
     CEncryptionRequest, CLoginDisconnect, CLoginSuccess, CSetCompression,
 };
 use pumpkin_protocol::java::client::play::{
-    CEntityVelocity, CKeepAlive, CLogin, CPlayDisconnect, CPlayerPosition,
+    CCombatDeath, CEntityStatus, CEntityVelocity, CKeepAlive, CLogin, CPlayDisconnect,
+    CPlayerPosition, CRespawn, CSetHealth,
 };
 use pumpkin_protocol::java::packet_decoder::TCPNetworkDecoder;
 use pumpkin_protocol::java::packet_encoder::TCPNetworkEncoder;
@@ -14,8 +15,8 @@ use pumpkin_protocol::java::server::config::{SAcknowledgeFinishConfig, SKnownPac
 use pumpkin_protocol::java::server::handshake::SHandShake;
 use pumpkin_protocol::java::server::login::{SEncryptionResponse, SLoginAcknowledged, SLoginStart};
 use pumpkin_protocol::java::server::play::{
-    FLAG_ON_GROUND, SChatMessage, SConfirmTeleport, SKeepAlive, SPlayerLoaded, SPlayerPosition,
-    SPlayerPositionRotation, SPlayerRotation, SSetPlayerGround, SSwingArm,
+    FLAG_ON_GROUND, SChatMessage, SClientCommand, SConfirmTeleport, SKeepAlive, SPlayerLoaded,
+    SPlayerPosition, SPlayerPositionRotation, SPlayerRotation, SSetPlayerGround, SSwingArm,
 };
 use pumpkin_protocol::packet::MultiVersionJavaPacket;
 use pumpkin_protocol::ser::NetworkWriteExt;
@@ -65,6 +66,7 @@ pub struct Client {
     message_spam_cooldown: AtomicU32,
     message_count: AtomicU32,
     is_loaded: AtomicBool,
+    pub is_dead: AtomicBool,
     swing_cooldown: AtomicU32,
 
     // Position & Physics
@@ -120,6 +122,7 @@ impl Client {
             entity_id: AtomicI32::new(0),
             closed: AtomicBool::new(false),
             is_loaded: AtomicBool::new(false),
+            is_dead: AtomicBool::new(false),
             close_interrupt: Arc::new(Notify::new()),
 
             message_spam_cooldown: AtomicU32::new(1),
@@ -246,7 +249,7 @@ impl Client {
         if self.connection_state.load() != ConnectionState::Play {
             return;
         }
-        if !self.is_loaded.load(Ordering::Relaxed) {
+        if !self.is_loaded.load(Ordering::Relaxed) || self.is_dead.load(Ordering::Relaxed) {
             return;
         }
 
@@ -765,6 +768,31 @@ impl Client {
                 })
                 .await;
                 self.is_loaded.store(true, Ordering::Relaxed);
+                self.is_dead.store(false, Ordering::Relaxed);
+            }
+            id if id == CCombatDeath::to_id(VERSION) => {
+                let player_id = bytebuf.get_var_int()?;
+                if player_id.0 == self.entity_id.load(Ordering::Relaxed) {
+                    self.respawn().await;
+                }
+            }
+            id if id == CSetHealth::to_id(VERSION) => {
+                let health = bytebuf.get_f32()?;
+                if health <= 0.0 {
+                    self.respawn().await;
+                } else {
+                    self.is_dead.store(false, Ordering::Relaxed);
+                }
+            }
+            id if id == CEntityStatus::to_id(VERSION) => {
+                let entity_id = bytebuf.get_i32_be()?;
+                let entity_status = bytebuf.get_i8()?;
+                if entity_id == self.entity_id.load(Ordering::Relaxed) && entity_status == 3 {
+                    self.respawn().await;
+                }
+            }
+            id if id == CRespawn::to_id(VERSION) => {
+                self.send_packet(&SPlayerLoaded).await;
             }
             id if id == CLogin::to_id(VERSION) => {
                 let entity_id = bytebuf.get_i32_be()?;
@@ -778,6 +806,25 @@ impl Client {
             _ => {}
         }
         Ok(())
+    }
+
+    pub async fn respawn(&self) {
+        if self
+            .is_dead
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.is_loaded.store(false, Ordering::Relaxed);
+            self.is_walking.store(false, Ordering::Relaxed);
+            self.velocity_x.store(0.0);
+            self.velocity_y.store(0.0);
+            self.velocity_z.store(0.0);
+
+            self.send_packet(&SClientCommand {
+                action_id: VarInt(0),
+            })
+            .await;
+        }
     }
 
     pub async fn close(&self) {
@@ -961,5 +1008,422 @@ mod tests {
         assert_eq!(ka_resp.keep_alive_id, 123456);
 
         assert!(client_process_handle.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_chat_message_with_encryption_and_compression() {
+        use pumpkin_protocol::java::client::play::CSystemChatMessage;
+        use pumpkin_util::text::TextComponent;
+        use rsa::RsaPrivateKey;
+        use rsa::pkcs8::EncodePublicKey;
+
+        let mut rng = rand::rng();
+        let server_private_key = RsaPrivateKey::new(&mut rng, 1024).unwrap();
+        let server_public_key_der = server_private_key
+            .to_public_key()
+            .to_public_key_der()
+            .unwrap()
+            .into_vec();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let connect_handle = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let client = Arc::new(Client::new(stream));
+            client.connection_state.store(ConnectionState::Login);
+            client
+        });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let client = connect_handle.await.unwrap();
+
+        let (server_reader, server_writer) = server_stream.into_split();
+        let mut server_decoder = TCPNetworkDecoder::new(BufReader::new(server_reader));
+        let mut server_encoder = TCPNetworkEncoder::new(BufWriter::new(server_writer));
+
+        // 1. Server sends CSetCompression (threshold 256)
+        let set_comp = CSetCompression {
+            threshold: VarInt(256),
+        };
+        let mut set_comp_buf = Vec::new();
+        Client::write_packet(&set_comp, &mut set_comp_buf).unwrap();
+        server_encoder
+            .write_packet(set_comp_buf.into())
+            .await
+            .unwrap();
+        server_encoder.flush().await.unwrap();
+
+        let client_clone = client.clone();
+        let handle = tokio::spawn(async move { client_clone.process_packets().await });
+        server_decoder.set_compression(256);
+        server_encoder.set_compression((256, 4));
+        assert!(handle.await.unwrap());
+
+        // 2. Server sends CEncryptionRequest
+        let verify_token = [1u8, 2, 3, 4];
+        let enc_req = CEncryptionRequest::new("", &server_public_key_der, &verify_token, false);
+        let mut enc_req_buf = Vec::new();
+        Client::write_packet(&enc_req, &mut enc_req_buf).unwrap();
+        server_encoder
+            .write_packet(enc_req_buf.into())
+            .await
+            .unwrap();
+        server_encoder.flush().await.unwrap();
+
+        let client_clone = client.clone();
+        let handle = tokio::spawn(async move { client_clone.process_packets().await });
+
+        let raw_resp = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_resp.id, SEncryptionResponse::to_id(VERSION));
+        let mut resp_payload = &raw_resp.payload[..];
+        let resp = SEncryptionResponse::read(&mut resp_payload, &VERSION).unwrap();
+
+        let decrypted_secret = server_private_key
+            .decrypt(Pkcs1v15Encrypt, &resp.shared_secret)
+            .unwrap();
+        let shared_secret: [u8; 16] = decrypted_secret.try_into().unwrap();
+        server_decoder.set_encryption(&shared_secret).unwrap();
+        server_encoder.set_encryption(&shared_secret).unwrap();
+        assert!(handle.await.unwrap());
+
+        // 3. Move to play state
+        client.connection_state.store(ConnectionState::Play);
+
+        // 4. Client sends SChatMessage
+        client.send_message("Hello from bot!").await;
+
+        // 5. Server reads SChatMessage
+        let raw_chat = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_chat.id, SChatMessage::to_id(VERSION));
+        let mut chat_payload = &raw_chat.payload[..];
+        let chat = SChatMessage::read(&mut chat_payload, &VERSION).unwrap();
+        assert_eq!(chat.message, "Hello from bot!");
+
+        // 6. Server broadcasts CSystemChatMessage (< 256 bytes uncompressed)
+        let text_comp = TextComponent::text("<BOT_0> Hello from bot!");
+        let sys_chat = CSystemChatMessage::new(&text_comp, false);
+        let mut chat_buf = Vec::new();
+        Client::write_packet(&sys_chat, &mut chat_buf).unwrap();
+        server_encoder.write_packet(chat_buf.into()).await.unwrap();
+        server_encoder.flush().await.unwrap();
+
+        // 7. Client receives and processes CSystemChatMessage
+        let client_clone = client.clone();
+        let handle = tokio::spawn(async move { client_clone.process_packets().await });
+        assert!(handle.await.unwrap());
+
+        // 8. Server sends CKeepAlive
+        let keep_alive = CKeepAlive {
+            keep_alive_id: 999999,
+        };
+        let mut ka_buf = Vec::new();
+        Client::write_packet(&keep_alive, &mut ka_buf).unwrap();
+        server_encoder.write_packet(ka_buf.into()).await.unwrap();
+        server_encoder.flush().await.unwrap();
+
+        // 9. Client receives and processes CKeepAlive, responds with SKeepAlive
+        let client_clone = client.clone();
+        let handle = tokio::spawn(async move { client_clone.process_packets().await });
+
+        let raw_ka_resp = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_ka_resp.id, SKeepAlive::to_id(VERSION));
+        let mut ka_resp_payload = &raw_ka_resp.payload[..];
+        let ka_resp = SKeepAlive::read(&mut ka_resp_payload, &VERSION).unwrap();
+        assert_eq!(ka_resp.keep_alive_id, 999999);
+        assert!(handle.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_multiple_compressed_packets_streaming() {
+        use pumpkin_protocol::java::client::play::CSystemChatMessage;
+        use pumpkin_util::text::TextComponent;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let connect_handle = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let client = Arc::new(Client::new(stream));
+            client.connection_state.store(ConnectionState::Play);
+            client
+        });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let client = connect_handle.await.unwrap();
+
+        let (server_reader, server_writer) = server_stream.into_split();
+        let mut server_decoder = TCPNetworkDecoder::new(BufReader::new(server_reader));
+        let mut server_encoder = TCPNetworkEncoder::new(BufWriter::new(server_writer));
+
+        // Enable compression on both client and server
+        client.set_compression(Some((256, 4))).await;
+        server_decoder.set_compression(256);
+        server_encoder.set_compression((256, 4));
+
+        // 1. Send a large packet (> 256 bytes, compressed)
+        let large_msg = "A".repeat(1000);
+        let text_comp = TextComponent::text(large_msg);
+        let sys_chat = CSystemChatMessage::new(&text_comp, false);
+        let mut chat_buf = Vec::new();
+        Client::write_packet(&sys_chat, &mut chat_buf).unwrap();
+        server_encoder.write_packet(chat_buf.into()).await.unwrap();
+
+        // 2. Immediately send a small packet (< 256 bytes, uncompressed)
+        let keep_alive = CKeepAlive {
+            keep_alive_id: 111222,
+        };
+        let mut ka_buf = Vec::new();
+        Client::write_packet(&keep_alive, &mut ka_buf).unwrap();
+        server_encoder.write_packet(ka_buf.into()).await.unwrap();
+        server_encoder.flush().await.unwrap();
+
+        // 3. Client receives large packet
+        let client_clone = client.clone();
+        let handle1 = tokio::spawn(async move { client_clone.process_packets().await });
+        assert!(handle1.await.unwrap());
+
+        // 4. Client receives keep_alive packet
+        let client_clone = client.clone();
+        let handle2 = tokio::spawn(async move { client_clone.process_packets().await });
+
+        let raw_ka_resp = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_ka_resp.id, SKeepAlive::to_id(VERSION));
+        let mut ka_resp_payload = &raw_ka_resp.payload[..];
+        let ka_resp = SKeepAlive::read(&mut ka_resp_payload, &VERSION).unwrap();
+        assert_eq!(ka_resp.keep_alive_id, 111222);
+        assert!(handle2.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_respawn_on_combat_death() {
+        use pumpkin_util::text::TextComponent;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let connect_handle = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let client = Arc::new(Client::new(stream));
+            client.connection_state.store(ConnectionState::Play);
+            client.entity_id.store(42, Ordering::Relaxed);
+            client.is_loaded.store(true, Ordering::Relaxed);
+            client
+        });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let client = connect_handle.await.unwrap();
+
+        let (server_reader, server_writer) = server_stream.into_split();
+        let mut server_decoder = TCPNetworkDecoder::new(BufReader::new(server_reader));
+        let mut server_encoder = TCPNetworkEncoder::new(BufWriter::new(server_writer));
+
+        // Server sends CCombatDeath for entity 42
+        let death_msg = TextComponent::text("Bot died");
+        let combat_death = CCombatDeath::new(VarInt(42), &death_msg);
+        let mut death_buf = Vec::new();
+        Client::write_packet(&combat_death, &mut death_buf).unwrap();
+        server_encoder.write_packet(death_buf.into()).await.unwrap();
+        server_encoder.flush().await.unwrap();
+
+        let client_clone = client.clone();
+        let handle = tokio::spawn(async move { client_clone.process_packets().await });
+
+        // Server receives SClientCommand with action_id 0 (respawn)
+        let raw_cmd = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_cmd.id, SClientCommand::to_id(VERSION));
+        let mut payload = &raw_cmd.payload[..];
+        let client_cmd = SClientCommand::read(&mut payload, &VERSION).unwrap();
+        assert_eq!(client_cmd.action_id.0, 0);
+
+        assert!(handle.await.unwrap());
+        assert!(client.is_dead.load(Ordering::Relaxed));
+        assert!(!client.is_loaded.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_respawn_on_set_health_zero() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let connect_handle = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let client = Arc::new(Client::new(stream));
+            client.connection_state.store(ConnectionState::Play);
+            client.is_loaded.store(true, Ordering::Relaxed);
+            client
+        });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let client = connect_handle.await.unwrap();
+
+        let (server_reader, server_writer) = server_stream.into_split();
+        let mut server_decoder = TCPNetworkDecoder::new(BufReader::new(server_reader));
+        let mut server_encoder = TCPNetworkEncoder::new(BufWriter::new(server_writer));
+
+        // Server sends CSetHealth with health 0.0
+        let set_health = CSetHealth::new(0.0, VarInt(20), 5.0);
+        let mut health_buf = Vec::new();
+        Client::write_packet(&set_health, &mut health_buf).unwrap();
+        server_encoder
+            .write_packet(health_buf.into())
+            .await
+            .unwrap();
+        server_encoder.flush().await.unwrap();
+
+        let client_clone = client.clone();
+        let handle = tokio::spawn(async move { client_clone.process_packets().await });
+
+        let raw_cmd = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_cmd.id, SClientCommand::to_id(VERSION));
+        let mut payload = &raw_cmd.payload[..];
+        let client_cmd = SClientCommand::read(&mut payload, &VERSION).unwrap();
+        assert_eq!(client_cmd.action_id.0, 0);
+
+        assert!(handle.await.unwrap());
+        assert!(client.is_dead.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_respawn_on_entity_status_death() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let connect_handle = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let client = Arc::new(Client::new(stream));
+            client.connection_state.store(ConnectionState::Play);
+            client.entity_id.store(100, Ordering::Relaxed);
+            client.is_loaded.store(true, Ordering::Relaxed);
+            client
+        });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let client = connect_handle.await.unwrap();
+
+        let (server_reader, server_writer) = server_stream.into_split();
+        let mut server_decoder = TCPNetworkDecoder::new(BufReader::new(server_reader));
+        let mut server_encoder = TCPNetworkEncoder::new(BufWriter::new(server_writer));
+
+        // Server sends CEntityStatus with entity_id 100, status 3 (death)
+        let entity_status = CEntityStatus::new(100, 3);
+        let mut status_buf = Vec::new();
+        Client::write_packet(&entity_status, &mut status_buf).unwrap();
+        server_encoder
+            .write_packet(status_buf.into())
+            .await
+            .unwrap();
+        server_encoder.flush().await.unwrap();
+
+        let client_clone = client.clone();
+        let handle = tokio::spawn(async move { client_clone.process_packets().await });
+
+        let raw_cmd = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_cmd.id, SClientCommand::to_id(VERSION));
+        let mut payload = &raw_cmd.payload[..];
+        let client_cmd = SClientCommand::read(&mut payload, &VERSION).unwrap();
+        assert_eq!(client_cmd.action_id.0, 0);
+
+        assert!(handle.await.unwrap());
+        assert!(client.is_dead.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_respawn_cycle_and_post_respawn_teleport() {
+        use pumpkin_data::dimension::Dimension;
+        use pumpkin_protocol::java::client::play::PlayerSpawnData;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let connect_handle = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let client = Arc::new(Client::new(stream));
+            client.connection_state.store(ConnectionState::Play);
+            client.entity_id.store(7, Ordering::Relaxed);
+            client.is_loaded.store(true, Ordering::Relaxed);
+            client
+        });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let client = connect_handle.await.unwrap();
+
+        let (server_reader, server_writer) = server_stream.into_split();
+        let mut server_decoder = TCPNetworkDecoder::new(BufReader::new(server_reader));
+        let mut server_encoder = TCPNetworkEncoder::new(BufWriter::new(server_writer));
+
+        // 1. Die via CSetHealth(0.0)
+        let set_health = CSetHealth::new(0.0, VarInt(20), 5.0);
+        let mut buf = Vec::new();
+        Client::write_packet(&set_health, &mut buf).unwrap();
+        server_encoder.write_packet(buf.into()).await.unwrap();
+        server_encoder.flush().await.unwrap();
+
+        let client_clone = client.clone();
+        let handle1 = tokio::spawn(async move { client_clone.process_packets().await });
+
+        // Server receives SClientCommand(0)
+        let raw_cmd = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_cmd.id, SClientCommand::to_id(VERSION));
+        assert!(handle1.await.unwrap());
+        assert!(client.is_dead.load(Ordering::Relaxed));
+
+        // 2. Server sends CRespawn
+        let spawn_data = PlayerSpawnData::new(
+            Dimension::OVERWORLD.clone(),
+            0,
+            0,
+            -1,
+            false,
+            false,
+            None,
+            VarInt(0),
+            VarInt(63),
+        );
+        let respawn = CRespawn::new(spawn_data, 0);
+        let mut buf = Vec::new();
+        Client::write_packet(&respawn, &mut buf).unwrap();
+        server_encoder.write_packet(buf.into()).await.unwrap();
+        server_encoder.flush().await.unwrap();
+
+        let client_clone = client.clone();
+        let handle2 = tokio::spawn(async move { client_clone.process_packets().await });
+
+        // Server receives SPlayerLoaded
+        let raw_loaded = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_loaded.id, SPlayerLoaded::to_id(VERSION));
+        assert!(handle2.await.unwrap());
+
+        // 3. Server sends CPlayerPosition (teleport)
+        let player_pos = CPlayerPosition::new(
+            VarInt(55),
+            Vector3::new(10.0, 64.0, 20.0),
+            Vector3::new(0.0, 0.0, 0.0),
+            90.0,
+            0.0,
+            Vec::new(),
+        );
+        let mut buf = Vec::new();
+        Client::write_packet(&player_pos, &mut buf).unwrap();
+        server_encoder.write_packet(buf.into()).await.unwrap();
+        server_encoder.flush().await.unwrap();
+
+        let client_clone = client.clone();
+        let handle3 = tokio::spawn(async move { client_clone.process_packets().await });
+
+        // Server receives SConfirmTeleport
+        let raw_confirm = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_confirm.id, SConfirmTeleport::to_id(VERSION));
+        let mut confirm_payload = &raw_confirm.payload[..];
+        let confirm = SConfirmTeleport::read(&mut confirm_payload, &VERSION).unwrap();
+        assert_eq!(confirm.teleport_id.0, 55);
+        assert!(handle3.await.unwrap());
+
+        // Bot state should now be alive and loaded
+        assert!(!client.is_dead.load(Ordering::Relaxed));
+        assert!(client.is_loaded.load(Ordering::Relaxed));
+        assert_eq!(client.current_x.load(), 10.0);
+        assert_eq!(client.current_y.load(), 64.0);
+        assert_eq!(client.current_z.load(), 20.0);
     }
 }
