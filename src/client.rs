@@ -1,7 +1,9 @@
 use crossbeam::atomic::AtomicCell;
 use pumpkin_protocol::codec::lp_vector_3d::LpVector3d;
 use pumpkin_protocol::codec::var_int::VarInt;
-use pumpkin_protocol::java::client::config::{CConfigDisconnect, CFinishConfig};
+use pumpkin_protocol::java::client::config::{
+    CConfigDisconnect, CConfigPing, CFinishConfig, CKnownPacks,
+};
 use pumpkin_protocol::java::client::login::{
     CEncryptionRequest, CLoginDisconnect, CLoginSuccess, CSetCompression,
 };
@@ -11,7 +13,7 @@ use pumpkin_protocol::java::client::play::{
 };
 use pumpkin_protocol::java::packet_decoder::TCPNetworkDecoder;
 use pumpkin_protocol::java::packet_encoder::TCPNetworkEncoder;
-use pumpkin_protocol::java::server::config::{SAcknowledgeFinishConfig, SKnownPacks};
+use pumpkin_protocol::java::server::config::{SAcknowledgeFinishConfig, SConfigPong, SKnownPacks};
 use pumpkin_protocol::java::server::handshake::SHandShake;
 use pumpkin_protocol::java::server::login::{SEncryptionResponse, SLoginAcknowledged, SLoginStart};
 use pumpkin_protocol::java::server::play::{
@@ -691,10 +693,22 @@ impl Client {
     }
 
     async fn handle_config_packet(&self, packet: &mut RawPacket) -> Result<(), ReadingError> {
+        let mut bytebuf = &packet.payload[..];
         match packet.id {
             id if id == CConfigDisconnect::to_id(VERSION) => {
                 log::error!("Kicking in Config State");
                 self.close().await;
+            }
+            id if id == CKnownPacks::to_id(VERSION) => {
+                log::trace!("Received CKnownPacks, sending SKnownPacks");
+                self.send_packet(&SKnownPacks {
+                    known_packs: Vec::new(),
+                })
+                .await;
+            }
+            id if id == CConfigPing::to_id(VERSION) => {
+                let ping = CConfigPing::read(&mut bytebuf, &VERSION)?;
+                self.send_packet(&SConfigPong { id: ping.id }).await;
             }
             id if id == CFinishConfig::to_id(VERSION) => {
                 log::trace!("Config -> Play");
@@ -1425,5 +1439,376 @@ mod tests {
         assert_eq!(client.current_x.load(), 10.0);
         assert_eq!(client.current_y.load(), 64.0);
         assert_eq!(client.current_z.load(), 20.0);
+    }
+
+    #[tokio::test]
+    async fn test_full_join_handshake_flow_with_encryption() {
+        use pumpkin_data::dimension::Dimension;
+        use pumpkin_protocol::java::client::play::PlayerSpawnData;
+        use rsa::RsaPrivateKey;
+        use rsa::pkcs8::EncodePublicKey;
+
+        let mut rng = rand::rng();
+        let server_private_key = RsaPrivateKey::new(&mut rng, 1024).unwrap();
+        let server_public_key_der = server_private_key
+            .to_public_key()
+            .to_public_key_der()
+            .unwrap()
+            .into_vec();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let connect_handle = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let client = Arc::new(Client::new(stream));
+            client.join_server(addr, "BOT_1".to_string()).await;
+            client
+        });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let client = connect_handle.await.unwrap();
+
+        let (server_reader, server_writer) = server_stream.into_split();
+        let mut server_decoder = TCPNetworkDecoder::new(BufReader::new(server_reader));
+        let mut server_encoder = TCPNetworkEncoder::new(BufWriter::new(server_writer));
+
+        // Start background packet processor for client
+        let client_proc = client.clone();
+        let proc_handle = tokio::spawn(async move {
+            while !client_proc.closed.load(Ordering::Relaxed) {
+                if !client_proc.process_packets().await {
+                    break;
+                }
+            }
+        });
+
+        // 1. Server receives SHandShake
+        let raw_handshake = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_handshake.id, 0); // SHandShake id is 0
+        let mut hs_payload = &raw_handshake.payload[..];
+        let handshake = SHandShake::read(&mut hs_payload, &VERSION).unwrap();
+        assert_eq!(handshake.next_state, ConnectionState::Login);
+
+        // 2. Server receives SLoginStart
+        let raw_login_start = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_login_start.id, SLoginStart::to_id(VERSION));
+        let mut ls_payload = &raw_login_start.payload[..];
+        let login_start = SLoginStart::read(&mut ls_payload, &VERSION).unwrap();
+        assert_eq!(login_start.name.as_ref(), "BOT_1");
+
+        // 3. Server sends CEncryptionRequest
+        let verify_token = [9u8, 8, 7, 6];
+        let enc_req = CEncryptionRequest::new("", &server_public_key_der, &verify_token, false);
+        let mut enc_req_buf = Vec::new();
+        Client::write_packet(&enc_req, &mut enc_req_buf).unwrap();
+        server_encoder
+            .write_packet(enc_req_buf.into())
+            .await
+            .unwrap();
+        server_encoder.flush().await.unwrap();
+
+        // 4. Server receives SEncryptionResponse (unencrypted)
+        let raw_enc_resp = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_enc_resp.id, SEncryptionResponse::to_id(VERSION));
+        let mut enc_resp_payload = &raw_enc_resp.payload[..];
+        let enc_resp = SEncryptionResponse::read(&mut enc_resp_payload, &VERSION).unwrap();
+
+        // Decrypt shared secret and verify token
+        let decrypted_secret = server_private_key
+            .decrypt(Pkcs1v15Encrypt, &enc_resp.shared_secret)
+            .unwrap();
+        let decrypted_token = server_private_key
+            .decrypt(Pkcs1v15Encrypt, &enc_resp.verify_token)
+            .unwrap();
+        assert_eq!(decrypted_token.as_slice(), &verify_token);
+        let shared_secret: [u8; 16] = decrypted_secret.try_into().unwrap();
+
+        // Enable encryption on server
+        server_decoder.set_encryption(&shared_secret).unwrap();
+        server_encoder.set_encryption(&shared_secret).unwrap();
+
+        // 5. Server sends encrypted CLoginSuccess
+        let bot_uuid = Uuid::new_v4();
+        let login_success = CLoginSuccess::new(&bot_uuid, "BOT_1", &[], false, Uuid::new_v4());
+        let mut ls_buf = Vec::new();
+        Client::write_packet(&login_success, &mut ls_buf).unwrap();
+        server_encoder.write_packet(ls_buf.into()).await.unwrap();
+        server_encoder.flush().await.unwrap();
+
+        // 6. Server receives encrypted SLoginAcknowledged
+        let raw_login_ack = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_login_ack.id, SLoginAcknowledged::to_id(VERSION));
+
+        // 7. Server receives encrypted SKnownPacks
+        let raw_known_packs = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_known_packs.id, SKnownPacks::to_id(VERSION));
+
+        // 8. Server sends encrypted CFinishConfig
+        let finish_config = CFinishConfig;
+        let mut fc_buf = Vec::new();
+        Client::write_packet(&finish_config, &mut fc_buf).unwrap();
+        server_encoder.write_packet(fc_buf.into()).await.unwrap();
+        server_encoder.flush().await.unwrap();
+
+        // 9. Server receives encrypted SAcknowledgeFinishConfig
+        let raw_ack_finish = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_ack_finish.id, SAcknowledgeFinishConfig::to_id(VERSION));
+
+        // 10. Server sends encrypted CLogin and CPlayerPosition
+        let spawn_data = PlayerSpawnData::new(
+            Dimension::OVERWORLD.clone(),
+            0,
+            0,
+            -1,
+            false,
+            false,
+            None,
+            VarInt(0),
+            VarInt(63),
+        );
+        let login_packet = CLogin::new(
+            123,
+            false,
+            &[],
+            VarInt(20),
+            VarInt(10),
+            VarInt(10),
+            false,
+            true,
+            false,
+            spawn_data,
+            false,
+            false,
+        );
+        let mut login_buf = Vec::new();
+        Client::write_packet(&login_packet, &mut login_buf).unwrap();
+        server_encoder.write_packet(login_buf.into()).await.unwrap();
+
+        let player_pos = CPlayerPosition::new(
+            VarInt(101),
+            Vector3::new(50.0, 70.0, -100.0),
+            Vector3::new(0.0, 0.0, 0.0),
+            45.0,
+            0.0,
+            Vec::new(),
+        );
+        let mut pos_buf = Vec::new();
+        Client::write_packet(&player_pos, &mut pos_buf).unwrap();
+        server_encoder.write_packet(pos_buf.into()).await.unwrap();
+        server_encoder.flush().await.unwrap();
+
+        // 11. Server receives encrypted SPlayerLoaded
+        let raw_loaded = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_loaded.id, SPlayerLoaded::to_id(VERSION));
+
+        // 12. Server receives encrypted SConfirmTeleport
+        let raw_teleport_confirm = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_teleport_confirm.id, SConfirmTeleport::to_id(VERSION));
+        let mut conf_payload = &raw_teleport_confirm.payload[..];
+        let confirm = SConfirmTeleport::read(&mut conf_payload, &VERSION).unwrap();
+        assert_eq!(confirm.teleport_id.0, 101);
+
+        // Verify bot state
+        assert_eq!(client.connection_state.load(), ConnectionState::Play);
+        assert!(client.is_loaded.load(Ordering::Relaxed));
+        assert!(!client.is_dead.load(Ordering::Relaxed));
+        assert_eq!(client.current_x.load(), 50.0);
+        assert_eq!(client.current_y.load(), 70.0);
+        assert_eq!(client.current_z.load(), -100.0);
+
+        // 13. Test bot actions in play state: Bot sends encrypted message
+        client.send_message("Bot connected successfully!").await;
+
+        let raw_chat = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_chat.id, SChatMessage::to_id(VERSION));
+        let mut chat_payload = &raw_chat.payload[..];
+        let chat = SChatMessage::read(&mut chat_payload, &VERSION).unwrap();
+        assert_eq!(chat.message, "Bot connected successfully!");
+
+        client.close().await;
+        let _ = proc_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_full_join_handshake_flow_with_encryption_and_compression() {
+        use pumpkin_data::dimension::Dimension;
+        use pumpkin_protocol::java::client::play::PlayerSpawnData;
+        use rsa::RsaPrivateKey;
+        use rsa::pkcs8::EncodePublicKey;
+
+        let mut rng = rand::rng();
+        let server_private_key = RsaPrivateKey::new(&mut rng, 1024).unwrap();
+        let server_public_key_der = server_private_key
+            .to_public_key()
+            .to_public_key_der()
+            .unwrap()
+            .into_vec();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let connect_handle = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let client = Arc::new(Client::new(stream));
+            client.join_server(addr, "BOT_COMPRESSED".to_string()).await;
+            client
+        });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let client = connect_handle.await.unwrap();
+
+        let (server_reader, server_writer) = server_stream.into_split();
+        let mut server_decoder = TCPNetworkDecoder::new(BufReader::new(server_reader));
+        let mut server_encoder = TCPNetworkEncoder::new(BufWriter::new(server_writer));
+
+        // Start background packet processor for client
+        let client_proc = client.clone();
+        let proc_handle = tokio::spawn(async move {
+            while !client_proc.closed.load(Ordering::Relaxed) {
+                if !client_proc.process_packets().await {
+                    break;
+                }
+            }
+        });
+
+        // 1. Server receives SHandShake & SLoginStart
+        let raw_handshake = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_handshake.id, 0);
+
+        let raw_login_start = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_login_start.id, SLoginStart::to_id(VERSION));
+
+        // 2. Server sends CSetCompression (threshold 256)
+        let set_comp = CSetCompression {
+            threshold: VarInt(256),
+        };
+        let mut comp_buf = Vec::new();
+        Client::write_packet(&set_comp, &mut comp_buf).unwrap();
+        server_encoder.write_packet(comp_buf.into()).await.unwrap();
+        server_encoder.flush().await.unwrap();
+
+        server_decoder.set_compression(256);
+        server_encoder.set_compression((256, 6));
+
+        // 3. Server sends CEncryptionRequest (now compressed/uncompressed according to threshold)
+        let verify_token = [3u8, 2, 1, 0];
+        let enc_req = CEncryptionRequest::new("", &server_public_key_der, &verify_token, false);
+        let mut enc_req_buf = Vec::new();
+        Client::write_packet(&enc_req, &mut enc_req_buf).unwrap();
+        server_encoder
+            .write_packet(enc_req_buf.into())
+            .await
+            .unwrap();
+        server_encoder.flush().await.unwrap();
+
+        // 4. Server receives SEncryptionResponse
+        let raw_enc_resp = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_enc_resp.id, SEncryptionResponse::to_id(VERSION));
+        let mut enc_resp_payload = &raw_enc_resp.payload[..];
+        let enc_resp = SEncryptionResponse::read(&mut enc_resp_payload, &VERSION).unwrap();
+
+        let decrypted_secret = server_private_key
+            .decrypt(Pkcs1v15Encrypt, &enc_resp.shared_secret)
+            .unwrap();
+        let decrypted_token = server_private_key
+            .decrypt(Pkcs1v15Encrypt, &enc_resp.verify_token)
+            .unwrap();
+        assert_eq!(decrypted_token.as_slice(), &verify_token);
+        let shared_secret: [u8; 16] = decrypted_secret.try_into().unwrap();
+
+        // Enable encryption on server (with compression already enabled)
+        server_decoder.set_encryption(&shared_secret).unwrap();
+        server_encoder.set_encryption(&shared_secret).unwrap();
+
+        // 5. Server sends encrypted & compressed CLoginSuccess
+        let bot_uuid = Uuid::new_v4();
+        let login_success =
+            CLoginSuccess::new(&bot_uuid, "BOT_COMPRESSED", &[], false, Uuid::new_v4());
+        let mut ls_buf = Vec::new();
+        Client::write_packet(&login_success, &mut ls_buf).unwrap();
+        server_encoder.write_packet(ls_buf.into()).await.unwrap();
+        server_encoder.flush().await.unwrap();
+
+        // 6. Server receives encrypted & compressed SLoginAcknowledged & SKnownPacks
+        let raw_login_ack = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_login_ack.id, SLoginAcknowledged::to_id(VERSION));
+
+        let raw_known_packs = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_known_packs.id, SKnownPacks::to_id(VERSION));
+
+        // 7. Server sends encrypted & compressed CFinishConfig
+        let finish_config = CFinishConfig;
+        let mut fc_buf = Vec::new();
+        Client::write_packet(&finish_config, &mut fc_buf).unwrap();
+        server_encoder.write_packet(fc_buf.into()).await.unwrap();
+        server_encoder.flush().await.unwrap();
+
+        // 8. Server receives encrypted & compressed SAcknowledgeFinishConfig
+        let raw_ack_finish = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_ack_finish.id, SAcknowledgeFinishConfig::to_id(VERSION));
+
+        // 9. Server sends encrypted & compressed CLogin and CPlayerPosition
+        let spawn_data = PlayerSpawnData::new(
+            Dimension::OVERWORLD.clone(),
+            0,
+            0,
+            -1,
+            false,
+            false,
+            None,
+            VarInt(0),
+            VarInt(63),
+        );
+        let login_packet = CLogin::new(
+            200,
+            false,
+            &[],
+            VarInt(20),
+            VarInt(10),
+            VarInt(10),
+            false,
+            true,
+            false,
+            spawn_data,
+            false,
+            false,
+        );
+        let mut login_buf = Vec::new();
+        Client::write_packet(&login_packet, &mut login_buf).unwrap();
+        server_encoder.write_packet(login_buf.into()).await.unwrap();
+
+        let player_pos = CPlayerPosition::new(
+            VarInt(77),
+            Vector3::new(12.3, 65.4, 78.9),
+            Vector3::new(0.0, 0.0, 0.0),
+            180.0,
+            10.0,
+            Vec::new(),
+        );
+        let mut pos_buf = Vec::new();
+        Client::write_packet(&player_pos, &mut pos_buf).unwrap();
+        server_encoder.write_packet(pos_buf.into()).await.unwrap();
+        server_encoder.flush().await.unwrap();
+
+        // 10. Server receives encrypted & compressed SPlayerLoaded and SConfirmTeleport
+        let raw_loaded = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_loaded.id, SPlayerLoaded::to_id(VERSION));
+
+        let raw_confirm = server_decoder.get_raw_packet().await.unwrap();
+        assert_eq!(raw_confirm.id, SConfirmTeleport::to_id(VERSION));
+        let mut conf_payload = &raw_confirm.payload[..];
+        let confirm = SConfirmTeleport::read(&mut conf_payload, &VERSION).unwrap();
+        assert_eq!(confirm.teleport_id.0, 77);
+
+        // Verify bot state
+        assert_eq!(client.connection_state.load(), ConnectionState::Play);
+        assert!(client.is_loaded.load(Ordering::Relaxed));
+        assert_eq!(client.current_x.load(), 12.3);
+        assert_eq!(client.current_y.load(), 65.4);
+        assert_eq!(client.current_z.load(), 78.9);
+
+        client.close().await;
+        let _ = proc_handle.await;
     }
 }

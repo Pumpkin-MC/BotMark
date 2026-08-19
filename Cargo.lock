@@ -1216,6 +1216,7 @@ dependencies = [
  "pumpkin-util",
  "pumpkin-world",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "uuid",
