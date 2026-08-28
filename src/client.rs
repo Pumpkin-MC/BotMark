@@ -255,23 +255,25 @@ impl Client {
             return;
         }
 
-        if let Some(spam_message) = &args.spam_message {
-            let result = self.message_spam_cooldown.fetch_update(
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-                |curr| {
-                    if curr == 0 {
-                        let delay = rand::random_range(
-                            args.spam_message_delay_min..args.spam_message_delay_max,
-                        );
-                        Some(delay)
-                    } else {
-                        Some(curr - 1)
-                    }
-                },
-            );
-            if let Ok(0) = result {
-                self.send_message(spam_message).await;
+        if args.enable_spam_message {
+            if let Some(spam_message) = &args.spam_message {
+                let result = self.message_spam_cooldown.fetch_update(
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                    |curr| {
+                        if curr == 0 {
+                            let delay = rand::random_range(
+                                args.spam_message_delay_min..args.spam_message_delay_max,
+                            );
+                            Some(delay)
+                        } else {
+                            Some(curr - 1)
+                        }
+                    },
+                );
+                if let Ok(0) = result {
+                    self.send_message(spam_message).await;
+                }
             }
         }
 

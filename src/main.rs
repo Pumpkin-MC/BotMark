@@ -18,22 +18,24 @@ pub struct Args {
     #[arg(short, long, default_value_t = 5000)]
     pub timeout: u64,
 
-    #[arg(long, default_value = "Please do not spam!")]
+    #[arg(long, default_value_t = true, default_missing_value = "true", num_args = 0..=1, action = clap::ArgAction::Set, alias = "enable_spam_message")]
+    pub enable_spam_message: bool,
+    #[arg(long, default_value = "Please do not spam!", alias = "spam_message")]
     pub spam_message: Option<String>,
-    #[arg(long, default_value_t = 150)]
+    #[arg(long, default_value_t = 150, alias = "spam_message_delay_min")]
     pub spam_message_delay_min: u32,
-    #[arg(long, default_value_t = 250)]
+    #[arg(long, default_value_t = 250, alias = "spam_message_delay_max")]
     pub spam_message_delay_max: u32,
 
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, default_missing_value = "true", num_args = 0..=1, action = clap::ArgAction::Set, alias = "enable_rotation")]
     pub enable_rotation: bool,
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, default_missing_value = "true", num_args = 0..=1, action = clap::ArgAction::Set, alias = "enable_swing")]
     pub enable_swing: bool,
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, default_missing_value = "true", num_args = 0..=1, action = clap::ArgAction::Set, alias = "enable_movement")]
     pub enable_movement: bool,
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, default_missing_value = "true", num_args = 0..=1, action = clap::ArgAction::Set, alias = "enable_jumping")]
     pub enable_jumping: bool,
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, default_missing_value = "true", num_args = 0..=1, action = clap::ArgAction::Set, alias = "enable_physics")]
     pub enable_physics: bool,
 }
 
