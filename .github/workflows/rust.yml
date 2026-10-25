@@ -38,7 +38,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, ubuntu-26.04-arm, windows-latest, windows-11-arm, macos-latest]
         toolchain:
           - stable
     steps:
@@ -51,7 +51,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, ubuntu-26.04-arm, windows-latest, windows-11-arm, macos-latest]
         toolchain:
           - stable
     steps:
@@ -67,7 +67,7 @@ jobs:
           if [ "${{ runner.os }}" == "Windows" ]; then EXT=".exe"; fi
           cp "target/release/botmark$EXT" "dist/botmark-${{ runner.arch }}-${{ runner.os }}$EXT"
       - name: Export executable
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: botmark-${{ runner.arch }}-${{ runner.os }}
           compression-level: 9
