@@ -49,7 +49,7 @@ use uuid::Uuid;
 
 use crate::Args;
 
-pub const VERSION: JavaMinecraftVersion = JavaMinecraftVersion::V_26_2;
+pub const VERSION: JavaMinecraftVersion = JavaMinecraftVersion::V_26_3;
 
 /// Everything which makes a Connection with our Server is a `Client`.
 pub struct Client {
@@ -255,25 +255,25 @@ impl Client {
             return;
         }
 
-        if args.enable_spam_message {
-            if let Some(spam_message) = &args.spam_message {
-                let result = self.message_spam_cooldown.fetch_update(
-                    Ordering::SeqCst,
-                    Ordering::Relaxed,
-                    |curr| {
-                        if curr == 0 {
-                            let delay = rand::random_range(
-                                args.spam_message_delay_min..args.spam_message_delay_max,
-                            );
-                            Some(delay)
-                        } else {
-                            Some(curr - 1)
-                        }
-                    },
-                );
-                if let Ok(0) = result {
-                    self.send_message(spam_message).await;
-                }
+        if args.enable_spam_message
+            && let Some(spam_message) = &args.spam_message
+        {
+            let result = self.message_spam_cooldown.try_update(
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+                |curr| {
+                    if curr == 0 {
+                        let delay = rand::random_range(
+                            args.spam_message_delay_min..args.spam_message_delay_max,
+                        );
+                        Some(delay)
+                    } else {
+                        Some(curr - 1)
+                    }
+                },
+            );
+            if let Ok(0) = result {
+                self.send_message(spam_message).await;
             }
         }
 
@@ -781,6 +781,9 @@ impl Client {
 
                 self.send_packet(&SConfirmTeleport {
                     teleport_id: packet.teleport_id,
+                    position: Vector3::new(x, y, z),
+                    yaw: packet.yaw,
+                    pitch: packet.pitch,
                 })
                 .await;
                 self.is_loaded.store(true, Ordering::Relaxed);

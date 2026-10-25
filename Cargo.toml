@@ -1,6 +1,6 @@
 [package]
 name = "botmark"
-version = "0.1.1"
+version = "1.0.2"
 edition = "2024"
 
 [profile.release]
@@ -9,22 +9,17 @@ codegen-units = 1
 
 [dependencies]
 # log
-log = "0.4"
+log = "0.4.34"
 simple_logger = "5.2.0"
 # CLI
-clap = { version = "4.6.6", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 # Networking
-tokio = { version = "1.53.1", features = ["net", "io-util"] }
+tokio = { version = "1.54.1", features = ["net", "io-util", "time", "signal", "macros", "rt-multi-thread"] }
 pumpkin-protocol = { git = "https://github.com/Pumpkin-MC/Pumpkin", package = "pumpkin-protocol", default-features = false, features = ["serverbound", "clientbound"]}
 pumpkin-util = { git = "https://github.com/Pumpkin-MC/Pumpkin", package = "pumpkin-util"}
 pumpkin-data = { git = "https://github.com/Pumpkin-MC/Pumpkin", package = "pumpkin-data"}
 
-crossbeam = "0.8.4"
-uuid = "1.25.0"
-rand = { git = "https://github.com/rust-random/rand"}
-rsa = { version = "=0.10.0-rc.18", default-features = false, features = ["std", "encoding"] }
-
-[patch."https://github.com/Pumpkin-MC/Pumpkin"]
-pumpkin-protocol = { path = "../Pumpkin/crates/pumpkin-protocol" }
-pumpkin-util = { path = "../Pumpkin/crates/pumpkin-util" }
-pumpkin-data = { path = "../Pumpkin/crates/pumpkin-data" }
+crossbeam = "0.8.5"
+uuid = "1.29.0"
+rand = "0.10.3"
+rsa = { version = "=0.10.0-rc.19", default-features = false, features = ["std", "encoding"] }
