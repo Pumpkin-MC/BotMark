@@ -39,6 +39,10 @@ Here's a detailed breakdown of all available command-line arguments:
   - The timeout (in milliseconds) for each bot connection.
   - Example: `--delay 500` (500 milliseconds delay)
   
+- **`--bedrock` (Optional, Default: `false`):**
+  - Connect Bedrock Edition bots over NetherNet WebRTC (targeting Pumpkin Bedrock servers).
+  - Example: `./botmark --ip 127.0.0.1:19132 --bedrock --count 50`
+
 - **`--enable_spam_message <false/true>` (Optional, Default: `true`):**
   - Enable periodic chat spam messages.
   - Example: `--enable_spam_message true`
